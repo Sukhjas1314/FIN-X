@@ -66,8 +66,10 @@ def _reset_eq_session():
 _quote_cache: dict = {}   # {symbol: (timestamp, data)}
 _hist_cache:  dict = {}   # {"symbol_period": (timestamp, data)}
 _cache_lock   = threading.Lock()
-QUOTE_TTL = 8    # seconds
-HIST_TTL  = 60   # seconds
+QUOTE_TTL       = 8    # seconds — live quote cache
+HIST_TTL        = 60   # seconds — 1w / 1m historical cache
+HIST_TTL_1D_OPEN   =  5  # seconds — intraday cache while market is open
+HIST_TTL_1D_CLOSED = 300 # seconds — intraday cache after market close
 
 # Common English words / finance terms to skip in symbol detection
 _STOPWORDS = {
@@ -279,14 +281,32 @@ def get_bulk_quotes(symbols: list) -> dict:
     """
     Get live NSE quotes for a list of symbols.
     Returns {symbol: quote_dict_or_None}. Deduplicates input.
+    Fetches in parallel (up to 10 concurrent) for performance.
     """
-    results: dict = {}
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     seen: set = set()
+    unique: list = []
     for sym in symbols:
         sym = sym.upper().strip().replace(".NS", "").replace(".BO", "")
         if sym and sym not in seen:
             seen.add(sym)
-            results[sym] = get_quote(sym)
+            unique.append(sym)
+
+    if not unique:
+        return {}
+
+    results: dict = {}
+    max_workers = min(10, len(unique))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(get_quote, sym): sym for sym in unique}
+        for future in as_completed(futures):
+            sym = futures[future]
+            try:
+                results[sym] = future.result()
+            except Exception as e:
+                print(f"[BulkQuotes] Error for {sym}: {e}")
+                results[sym] = None
     return results
 
 
@@ -304,9 +324,20 @@ def get_historical(symbol: str, period: str = "1m") -> list:
 
     cache_key = f"{symbol}_{period}"
     now = time.time()
+
+    # Use a shorter TTL for intraday data while the market is live
+    if period == '1d':
+        try:
+            from services.market_hours import is_market_open
+            _ttl = HIST_TTL_1D_OPEN if is_market_open() else HIST_TTL_1D_CLOSED
+        except Exception:
+            _ttl = HIST_TTL
+    else:
+        _ttl = HIST_TTL
+
     with _cache_lock:
         entry = _hist_cache.get(cache_key)
-        if entry and (now - entry[0]) < HIST_TTL:
+        if entry and (now - entry[0]) < _ttl:
             return entry[1]
 
     _period_map = {

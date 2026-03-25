@@ -1,7 +1,9 @@
 # backend/routers/market.py
 """
-Market movers endpoint — top gainers, losers, cheapest, most expensive.
-Uses a 30-second in-memory cache to avoid hammering NSE on every request.
+Market endpoints:
+  GET /market/status         — IST market open/close flag
+  GET /market/live/{symbol}  — fast live quote + intraday chart (served from cache)
+  GET /market/movers         — top gainers, losers, cheapest, most expensive
 """
 import time
 from fastapi import APIRouter
@@ -9,30 +11,123 @@ from fastapi.responses import JSONResponse
 
 router = APIRouter()
 
-# ── In-memory cache ───────────────────────────────────────────
+# ── In-memory movers cache ────────────────────────────────────
 _cache: dict = {}
-_CACHE_TTL   = 30  # seconds
+_CACHE_TTL_OPEN   =  5   # seconds — during market hours (aggressive refresh)
+_CACHE_TTL_CLOSED = 120  # seconds — after market close (stale is fine)
 
-# Curated set of liquid NSE stocks for movers
+# Broad NSE stock pool — 50 liquid stocks across sectors.
+# Large enough to always fill 10 gainers + 10 losers + cheapest + expensive.
 _SYMBOLS = [
+    # Nifty 50 heavyweights
     'RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ICICIBANK',
     'TATAMOTORS', 'WIPRO', 'BAJFINANCE', 'SUNPHARMA', 'ITC',
     'SBIN', 'ADANIENT', 'MARUTI', 'BHARTIARTL', 'AXISBANK',
     'KOTAKBANK', 'LT', 'HCLTECH', 'TITAN', 'ONGC',
     'NTPC', 'JSWSTEEL', 'TATASTEEL', 'DRREDDY', 'CIPLA',
     'EICHERMOT', 'HEROMOTOCO', 'BPCL', 'HINDALCO', 'COALINDIA',
+    # Additional Nifty 50 / large-cap
+    'ULTRACEMCO', 'TECHM', 'BAJAJFINSV', 'ASIANPAINT', 'NESTLEIND',
+    'POWERGRID', 'DIVISLAB', 'GRASIM', 'INDUSINDBK', 'TATACONSUM',
+    'BRITANNIA', 'APOLLOHOSP', 'SHREECEM', 'SBILIFE', 'HDFCLIFE',
+    'PIDILITIND', 'DABUR', 'BERGEPAINT', 'MARICO', 'MUTHOOTFIN',
 ]
 
 
+# ── /market/status ────────────────────────────────────────────
+@router.get('/market/status')
+def get_market_status():
+    """Return current IST time and whether the NSE market is open."""
+    try:
+        from services.market_hours import market_status
+        return {'success': True, 'data': market_status(), 'error': None}
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={'success': False, 'data': None, 'error': str(e)},
+        )
+
+
+# ── /market/live/{symbol} ─────────────────────────────────────
+@router.get('/market/live/{symbol}')
+def get_live_quote(symbol: str):
+    """
+    Fast endpoint for real-time price + intraday chart.
+    Served from the in-memory quote cache (8-second TTL).
+    Intraday data cache: 5 s while market open, 5 min when closed.
+    Never blocks on AI generation — pure cache / NSE fetch only.
+    """
+    try:
+        from services.symbol_resolver import normalize_symbol
+        from services.nse_service import get_quote, get_historical
+        from services.market_hours import market_status
+
+        symbol = normalize_symbol(symbol)
+        if not symbol:
+            return JSONResponse(
+                status_code=400,
+                content={'success': False, 'data': None, 'error': 'Invalid symbol'},
+            )
+
+        status  = market_status()
+        quote   = get_quote(symbol)
+        intraday = get_historical(symbol, '1d')
+
+        if quote is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    'success': False,
+                    'data':    None,
+                    'error':   f'Quote unavailable for {symbol}',
+                },
+            )
+
+        return {
+            'success': True,
+            'data': {
+                'symbol':      symbol,
+                'price':       quote.get('price'),
+                'change':      quote.get('change'),
+                'change_pct':  quote.get('percent_change'),
+                'open':        quote.get('open'),
+                'high':        quote.get('high'),
+                'low':         quote.get('low'),
+                'volume':      quote.get('volume'),
+                'prev_close':  quote.get('prev_close'),
+                'intraday':    intraday,
+                'market_open': status['is_open'],
+                'time_ist':    status['time_ist'],
+                'date_ist':    status['date_ist'],
+            },
+            'error': None,
+        }
+
+    except Exception as e:
+        print(f'[LiveQuote] Error for {symbol}: {e}')
+        return JSONResponse(
+            status_code=500,
+            content={'success': False, 'data': None, 'error': str(e)},
+        )
+
+
+# ── /market/movers ────────────────────────────────────────────
 @router.get('/market/movers')
 def get_market_movers():
     """
     Returns top gainers, losers, cheapest and most expensive NSE stocks
     from a curated watchlist. Cached for 30 seconds.
     """
+    # Dynamic TTL: fast refresh during market hours, slower when closed
+    try:
+        from services.market_hours import is_market_open
+        _ttl = _CACHE_TTL_OPEN if is_market_open() else _CACHE_TTL_CLOSED
+    except Exception:
+        _ttl = _CACHE_TTL_CLOSED
+
     # Serve from cache if fresh
     cached = _cache.get('movers')
-    if cached and (time.time() - cached['ts']) < _CACHE_TTL:
+    if cached and (time.time() - cached['ts']) < _ttl:
         return {'success': True, 'data': cached['data'], 'error': None}
 
     try:
@@ -67,11 +162,24 @@ def get_market_movers():
         by_pct   = sorted(stocks, key=lambda x: x['change_pct'], reverse=True)
         by_price = sorted(stocks, key=lambda x: float(x['price']))
 
+        # Always fill all 10 slots:
+        # Gainers = top 10 by % change (positive first, fill rest if needed)
+        # Losers  = bottom 10 by % change (negative first, fill rest if needed)
+        gainers_pos = [s for s in by_pct if s['change_pct'] > 0]
+        gainers = gainers_pos[:10]
+        if len(gainers) < 10:
+            gainers += [s for s in by_pct if s['change_pct'] <= 0][:10 - len(gainers)]
+
+        losers_neg = [s for s in reversed(by_pct) if s['change_pct'] < 0]
+        losers = losers_neg[:10]
+        if len(losers) < 10:
+            losers += [s for s in by_pct if s['change_pct'] >= 0][-10 + len(losers):]
+
         data = {
-            'gainers':   [s for s in by_pct if s['change_pct'] > 0][:6],
-            'losers':    [s for s in reversed(by_pct) if s['change_pct'] < 0][:6],
-            'cheapest':  by_price[:6],
-            'expensive': list(reversed(by_price))[:6],
+            'gainers':   gainers,
+            'losers':    losers,
+            'cheapest':  by_price[:10],
+            'expensive': list(reversed(by_price))[:10],
             'total':     len(stocks),
         }
 

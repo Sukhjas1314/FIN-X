@@ -8,6 +8,21 @@ logging.basicConfig(level=logging.INFO)
 logger    = logging.getLogger('[Scheduler]')
 scheduler = BackgroundScheduler()
 
+# All 50 movers symbols kept hot in the quote cache during market hours.
+# Matches _SYMBOLS in routers/market.py — update both together.
+_LIVE_SYMBOLS = [
+    'RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ICICIBANK',
+    'TATAMOTORS', 'WIPRO', 'BAJFINANCE', 'SUNPHARMA', 'ITC',
+    'SBIN', 'ADANIENT', 'MARUTI', 'BHARTIARTL', 'AXISBANK',
+    'KOTAKBANK', 'LT', 'HCLTECH', 'TITAN', 'ONGC',
+    'NTPC', 'JSWSTEEL', 'TATASTEEL', 'DRREDDY', 'CIPLA',
+    'EICHERMOT', 'HEROMOTOCO', 'BPCL', 'HINDALCO', 'COALINDIA',
+    'ULTRACEMCO', 'TECHM', 'BAJAJFINSV', 'ASIANPAINT', 'NESTLEIND',
+    'POWERGRID', 'DIVISLAB', 'GRASIM', 'INDUSINDBK', 'TATACONSUM',
+    'BRITANNIA', 'APOLLOHOSP', 'SHREECEM', 'SBILIFE', 'HDFCLIFE',
+    'PIDILITIND', 'DABUR', 'BERGEPAINT', 'MARICO', 'MUTHOOTFIN',
+]
+
 
 def run_radar_job():
     """
@@ -130,6 +145,89 @@ def prefetch_popular_stocks():
             logger.error(f'Pre-fetch failed for {symbol}: {e}')
 
 
+def refresh_live_quotes():
+    """
+    Pre-warm the in-memory quote cache for all 50 movers symbols.
+    Runs every 10 seconds via APScheduler. No-op outside market hours.
+    Parallel fetch (ThreadPoolExecutor in get_bulk_quotes) keeps this fast.
+    max_instances=1 prevents overlapping runs if NSE is slow.
+    """
+    try:
+        from services.market_hours import is_market_open
+        if not is_market_open():
+            return   # no-op outside market hours
+        from services.nse_service import get_bulk_quotes
+        get_bulk_quotes(_LIVE_SYMBOLS)
+        logger.debug(f'[LiveQuotes] Cache warmed for {len(_LIVE_SYMBOLS)} symbols')
+    except Exception as e:
+        logger.warning(f'[LiveQuotes] Refresh error: {e}')
+
+
+def refresh_movers_cache():
+    """
+    Pre-warm the market movers in-memory cache so the /market/movers
+    endpoint always responds from cache (< 5 ms) during market hours.
+    Runs every 8 seconds — just inside the 8-second quote TTL window.
+    """
+    try:
+        from services.market_hours import is_market_open
+        if not is_market_open():
+            return
+        # Trigger the movers endpoint logic directly to refresh its cache
+        from routers.market import _SYMBOLS, _cache
+        from services.nse_service import get_bulk_quotes
+        from services.search_service import NSE_STOCKS
+        import time as _time
+
+        quotes = get_bulk_quotes(_SYMBOLS)
+        stocks = []
+        for sym, q in quotes.items():
+            if not q or q.get('price') is None:
+                continue
+            pct = q.get('percent_change')
+            try:
+                pct = float(pct) if pct is not None else 0.0
+            except (ValueError, TypeError):
+                pct = 0.0
+            stocks.append({
+                'symbol':     sym,
+                'name':       NSE_STOCKS.get(sym, sym),
+                'price':      q['price'],
+                'change_pct': round(pct, 2),
+                'change':     q.get('change', 0),
+            })
+
+        if not stocks:
+            return
+
+        by_pct   = sorted(stocks, key=lambda x: x['change_pct'], reverse=True)
+        by_price = sorted(stocks, key=lambda x: float(x['price']))
+
+        gainers_pos = [s for s in by_pct if s['change_pct'] > 0]
+        gainers = gainers_pos[:10]
+        if len(gainers) < 10:
+            gainers += [s for s in by_pct if s['change_pct'] <= 0][:10 - len(gainers)]
+
+        losers_neg = [s for s in reversed(by_pct) if s['change_pct'] < 0]
+        losers = losers_neg[:10]
+        if len(losers) < 10:
+            losers += [s for s in by_pct if s['change_pct'] >= 0][-10 + len(losers):]
+
+        _cache['movers'] = {
+            'data': {
+                'gainers':   gainers,
+                'losers':    losers,
+                'cheapest':  by_price[:10],
+                'expensive': list(reversed(by_price))[:10],
+                'total':     len(stocks),
+            },
+            'ts': _time.time(),
+        }
+        logger.debug(f'[MoversCache] Pre-warmed — {len(stocks)} stocks')
+    except Exception as e:
+        logger.warning(f'[MoversCache] Refresh error: {e}')
+
+
 def start_scheduler():
     """
     Configures and starts the APScheduler background scheduler.
@@ -164,6 +262,25 @@ def start_scheduler():
         trigger          = 'date',
         run_date         = dt.datetime.now() + dt.timedelta(seconds=30),
         id               = 'prefetch_startup',
+        replace_existing = True,
+    )
+
+    # Live quote cache warmer — all 50 movers symbols, every 10 s
+    scheduler.add_job(
+        refresh_live_quotes,
+        trigger          = IntervalTrigger(seconds=10),
+        id               = 'live_quote_refresh',
+        max_instances    = 1,
+        replace_existing = True,
+    )
+
+    # Movers cache pre-warmer — every 8 s during market hours
+    # Keeps /market/movers always served from in-memory cache (< 5 ms)
+    scheduler.add_job(
+        refresh_movers_cache,
+        trigger          = IntervalTrigger(seconds=8),
+        id               = 'movers_cache_refresh',
+        max_instances    = 1,
         replace_existing = True,
     )
 

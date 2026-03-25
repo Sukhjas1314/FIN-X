@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { TrendingUp, TrendingDown, DollarSign, Gem, RefreshCw, AlertCircle } from 'lucide-react'
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api'
@@ -68,36 +68,60 @@ function MoverCard({ stock, badgeCls, onSelect }) {
   )
 }
 
-function SectionRow({ section, stocks, onSelect }) {
+function PlaceholderCard() {
+  return (
+    <div className="flex-shrink-0 w-40 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl p-3 animate-pulse">
+      <div className="flex items-start justify-between mb-1.5">
+        <div className="h-3 w-16 bg-gray-200 dark:bg-gray-700 rounded" />
+        <div className="h-3 w-10 bg-gray-100 dark:bg-gray-600 rounded-full" />
+      </div>
+      <div className="h-2 w-24 bg-gray-100 dark:bg-gray-700 rounded mb-2" />
+      <div className="h-4 w-14 bg-gray-200 dark:bg-gray-700 rounded" />
+    </div>
+  )
+}
+
+function SectionRow({ section, stocks, onSelect, marketOpen }) {
   const Icon = section.icon
-  if (!stocks || stocks.length === 0) return null
+  const list = stocks || []
 
   return (
     <div className={`rounded-2xl border ${section.borderCls} ${section.bgCls} p-4`}>
       <div className="flex items-center gap-2 mb-3">
         <Icon className={`w-4 h-4 ${section.colorCls} flex-shrink-0`} />
         <h3 className={`text-sm font-bold ${section.colorCls}`}>{section.label}</h3>
-        <span className="text-xs text-gray-400 ml-auto">{stocks.length} stocks</span>
+        {marketOpen && list.length > 0 && (
+          <span className="flex items-center gap-0.5 text-[9px] font-semibold text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-950/30 px-1.5 py-0.5 rounded-full border border-green-200 dark:border-green-800/40">
+            <span className="w-1 h-1 rounded-full bg-green-500 animate-pulse inline-block" />
+            LIVE
+          </span>
+        )}
+        <span className="text-xs text-gray-400 ml-auto">{list.length} stocks</span>
       </div>
       <div className="flex gap-2 overflow-x-auto pb-1" style={{ scrollbarWidth: 'none' }}>
-        {stocks.map(stock => (
-          <MoverCard
-            key={stock.symbol}
-            stock={stock}
-            badgeCls={section.badgeCls}
-            onSelect={onSelect}
-          />
-        ))}
+        {list.length > 0
+          ? list.map(stock => (
+              <MoverCard
+                key={stock.symbol}
+                stock={stock}
+                badgeCls={section.badgeCls}
+                onSelect={onSelect}
+              />
+            ))
+          : Array.from({ length: 5 }).map((_, i) => <PlaceholderCard key={i} />)
+        }
       </div>
     </div>
   )
 }
 
 export default function MarketMovers({ onSelectStock }) {
-  const [data,     setData]     = useState(null)
-  const [loading,  setLoading]  = useState(true)
-  const [error,    setError]    = useState(null)
+  const [data,      setData]    = useState(null)
+  const [loading,   setLoading] = useState(true)
+  const [error,     setError]   = useState(null)
   const [lastFetch, setLast]    = useState(null)
+  const [marketOpen, setMarket] = useState(false)
+  const pollRef     = useRef(null)
 
   const fetchMovers = async (silent = false) => {
     if (!silent) setLoading(true)
@@ -118,13 +142,32 @@ export default function MarketMovers({ onSelectStock }) {
     }
   }
 
+  // Check market status once on mount
   useEffect(() => {
-    fetchMovers()
-    // Refresh every 60 seconds
-    const t = setInterval(() => fetchMovers(true), 60_000)
+    const checkStatus = async () => {
+      try {
+        const res  = await fetch(`${API_BASE}/market/status`)
+        const json = await res.json()
+        setMarket(json.data?.is_open ?? false)
+      } catch {
+        // keep default (false = closed = 60s interval)
+      }
+    }
+    checkStatus()
+    const t = setInterval(checkStatus, 60_000)
     return () => clearInterval(t)
   }, [])
 
+  // Market-aware polling: 5 s when open, 60 s when closed
+  useEffect(() => {
+    clearInterval(pollRef.current)
+    fetchMovers()
+    const interval = marketOpen ? 5_000 : 60_000
+    pollRef.current = setInterval(() => fetchMovers(true), interval)
+    return () => clearInterval(pollRef.current)
+  }, [marketOpen])
+
+  // Always render all 4 sections (no early "null" return when empty)
   if (loading && !data) {
     return (
       <div className="space-y-3">
@@ -148,17 +191,12 @@ export default function MarketMovers({ onSelectStock }) {
     )
   }
 
-  if (!data) return null
-
-  const hasAny = SECTIONS.some(s => data[s.key]?.length > 0)
-  if (!hasAny) return null
-
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-base font-bold text-gray-900 dark:text-white">Market Movers</h2>
-          {lastFetch && (
+          {lastFetch && data && (
             <p className="text-xs text-gray-400 mt-0.5">
               {data.total} stocks · updated {lastFetch.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}
             </p>
@@ -178,8 +216,9 @@ export default function MarketMovers({ onSelectStock }) {
           <SectionRow
             key={section.key}
             section={section}
-            stocks={data[section.key]}
+            stocks={data?.[section.key] || []}
             onSelect={onSelectStock}
+            marketOpen={marketOpen}
           />
         ))}
       </div>

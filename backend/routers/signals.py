@@ -50,6 +50,44 @@ def get_signals(
             except Exception as e:
                 print(f'[Signals] Price enrichment failed: {e}')
 
+        # Replace stale "temporarily unavailable" explanations with rule-based analysis
+        _STALE = 'Signal analysis temporarily unavailable.'
+        stale_ids = [
+            s['deal_id'] for s in signals
+            if s.get('explanation') == _STALE and s.get('deal_id')
+        ]
+        if stale_ids:
+            try:
+                from services.gpt import _rule_based_signal_explanation
+                ph = ','.join('?' * len(stale_ids))
+                deals_rows = db_fetchall(
+                    f'SELECT * FROM bulk_deals WHERE id IN ({ph})',
+                    tuple(stale_ids),
+                )
+                deals_map = {d['id']: d for d in deals_rows}
+                for sig in signals:
+                    if sig.get('explanation') == _STALE and sig.get('deal_id') in deals_map:
+                        deal = deals_map[sig['deal_id']]
+                        stock = {
+                            'symbol':        sig.get('symbol', ''),
+                            'current_price': sig.get('price'),
+                            'change_pct':    sig.get('percent_change') or 0,
+                            'rsi':           None,
+                            'ema_signal':    'neutral',
+                            'high_52w':      None,
+                            'low_52w':       None,
+                        }
+                        rb = _rule_based_signal_explanation(deal, stock)
+                        sig.update({
+                            'explanation':     rb['explanation'],
+                            'signal_type':     rb.get('signal_type',     sig.get('signal_type', 'neutral')),
+                            'risk_level':      rb.get('risk_level',      sig.get('risk_level',  'medium')),
+                            'confidence':      rb.get('confidence',      sig.get('confidence',   50)),
+                            'key_observation': rb.get('key_observation', sig.get('key_observation', '')),
+                        })
+            except Exception as e:
+                print(f'[Signals] Stale explanation fix failed: {e}')
+
         return {'success': True, 'data': {'signals': signals}, 'error': None}
     except Exception as e:
         return JSONResponse(

@@ -230,28 +230,168 @@ def _build_stock_context(user_message: str) -> str:
         print(f'[StockContext] Error: {e}')
         return ''
 
+# ── Rule-based signal engine ──────────────────────────────────
+def _rule_based_signal_explanation(deal: dict, stock_data: dict) -> dict:
+    """
+    Generate a real, data-driven signal explanation when AI is unavailable.
+    Derives risk level, signal type, and explanation from actual indicators.
+    """
+    symbol     = (deal.get('symbol') or stock_data.get('symbol') or 'UNKNOWN').upper()
+    qty        = deal.get('quantity') or deal.get('qty') or 0
+    deal_price = deal.get('price') or deal.get('deal_price') or stock_data.get('current_price') or 0
+    client     = (
+        deal.get('client_name') or deal.get('client') or
+        deal.get('buyer_name')  or deal.get('seller_name') or
+        'Institutional participant'
+    )
+    deal_type  = deal.get('deal_type') or deal.get('type') or 'bulk'
+
+    rsi          = stock_data.get('rsi')
+    ema_signal   = (stock_data.get('ema_signal') or 'neutral').lower()
+    change_pct   = float(stock_data.get('change_pct') or 0)
+    current_px   = float(stock_data.get('current_price') or deal_price or 0)
+    high_52w     = stock_data.get('high_52w')
+    low_52w      = stock_data.get('low_52w')
+
+    # ── Signal type from combined indicators ──────────────────
+    bull = 0
+    bear = 0
+    if change_pct > 1:
+        bull += 1
+    elif change_pct < -1:
+        bear += 1
+    if 'bullish' in ema_signal:
+        bull += 1
+    elif 'bearish' in ema_signal:
+        bear += 1
+    if rsi is not None:
+        if rsi <= 35:
+            bull += 1   # oversold → mean-reversion upside
+        elif rsi >= 65:
+            bear += 1   # overbought → potential correction
+
+    if bull > bear:
+        signal_type = 'bullish'
+    elif bear > bull:
+        signal_type = 'bearish'
+    else:
+        signal_type = 'neutral'
+
+    # ── Risk level from actual indicators ─────────────────────
+    risk_score = 0
+    if rsi is not None:
+        if rsi >= 75 or rsi <= 25:
+            risk_score += 3
+        elif rsi >= 70 or rsi <= 30:
+            risk_score += 2
+        elif rsi >= 65 or rsi <= 35:
+            risk_score += 1
+    if abs(change_pct) >= 5:
+        risk_score += 3
+    elif abs(change_pct) >= 3:
+        risk_score += 2
+    elif abs(change_pct) >= 1.5:
+        risk_score += 1
+    if 'crossover' in ema_signal:
+        risk_score += 1   # transitional phase = uncertainty
+    if current_px and high_52w and low_52w:
+        try:
+            rng = float(high_52w) - float(low_52w)
+            if rng > 0:
+                pos = (current_px - float(low_52w)) / rng
+                if pos >= 0.92 or pos <= 0.08:
+                    risk_score += 2  # near 52w extreme
+        except (TypeError, ValueError):
+            pass
+
+    if risk_score >= 5:
+        risk_level = 'high'
+    elif risk_score >= 2:
+        risk_level = 'medium'
+    else:
+        risk_level = 'low'
+
+    # ── Build explanation ─────────────────────────────────────
+    qty_str  = f'{int(qty):,}' if qty else 'significant'
+    px_str   = f'₹{float(deal_price):,.2f}' if deal_price else 'market price'
+    direction = 'up' if change_pct >= 0 else 'down'
+
+    explanation = (
+        f'{client} executed a {deal_type} deal of {qty_str} shares of {symbol} '
+        f'at {px_str}. The stock is {direction} {abs(change_pct):.2f}% today'
+    )
+    if rsi is not None:
+        rsi_desc = ('overbought' if rsi >= 70 else
+                    'oversold'   if rsi <= 30 else
+                    'neutral zone')
+        explanation += f', with RSI at {round(rsi, 1)} ({rsi_desc})'
+    explanation += f'. EMA trend is {ema_signal.replace("_", " ")}.'
+    if current_px and high_52w and low_52w:
+        try:
+            rng = float(high_52w) - float(low_52w)
+            if rng > 0:
+                pos = (current_px - float(low_52w)) / rng * 100
+                explanation += (
+                    f' Trading at {round(pos)}% of its 52-week range '
+                    f'(₹{float(low_52w):,.0f}–₹{float(high_52w):,.0f}).'
+                )
+        except (TypeError, ValueError):
+            pass
+
+    # ── Key observation ───────────────────────────────────────
+    if signal_type == 'bullish':
+        key_obs = f'{deal_type.capitalize()} deal at {px_str} with bullish setup — EMA: {ema_signal.replace("_"," ")}.'
+        if rsi is not None and rsi <= 35:
+            key_obs += ' RSI in oversold territory suggests mean-reversion potential.'
+    elif signal_type == 'bearish':
+        key_obs = f'Deal at {px_str} amid bearish technicals. Monitor support levels closely.'
+        if rsi is not None and rsi >= 65:
+            key_obs += ' Elevated RSI — institutional selling pressure may persist.'
+    else:
+        key_obs = (
+            f'Deal at {px_str}. Mixed signals — watch EMA convergence '
+            f'and volume confirmation before positioning.'
+        )
+
+    confidence = max(30, min(85, 50 + bull * 8 - bear * 5))
+
+    return {
+        'explanation':     explanation,
+        'signal_type':     signal_type,
+        'risk_level':      risk_level,
+        'confidence':      confidence,
+        'key_observation': key_obs,
+        'disclaimer':      'For educational purposes only. Not SEBI-registered investment advice.',
+    }
+
+
 # ── Public API ────────────────────────────────────────────────
 
 def explain_signal(deal: dict, stock_data: dict) -> dict:
-    """Explains a raw NSE bulk/block deal. Returns structured dict."""
-    _fallback = {
-        'explanation':     'Signal analysis temporarily unavailable.',
-        'signal_type':     'neutral',
-        'risk_level':      'medium',
-        'confidence':      50,
-        'key_observation': '',
-        'disclaimer':      'For educational purposes only. Not SEBI-registered investment advice.',
-    }
+    """
+    Explains a raw NSE bulk/block deal. Returns structured dict.
+    Tries AI first; falls back to rule-based engine — never returns generic
+    'Signal analysis temporarily unavailable.' text.
+    """
     try:
         prompt = SIGNAL_PROMPT.format(
             deal_json  = json.dumps(deal,       indent=2),
             price_json = json.dumps(stock_data, indent=2),
         )
-        raw = gemini_call(prompt, json_mode=True, max_tokens=512)
-        return parse_json_response(raw, fallback=_fallback)
+        raw    = gemini_call(prompt, json_mode=True, max_tokens=512)
+        result = parse_json_response(raw, fallback=None)
+        if result and result.get('explanation') and \
+                result['explanation'] not in ('Signal analysis temporarily unavailable.', ''):
+            # Ensure risk_level is one of the valid values
+            if result.get('risk_level') not in ('low', 'medium', 'high'):
+                result['risk_level'] = 'medium'
+            return result
     except Exception as e:
         print(f'[AI] explain_signal error: {e}')
-        return _fallback
+
+    # AI unavailable or returned bad data — use rule-based fallback
+    print(f'[AI] Using rule-based fallback for {deal.get("symbol", "?")}')
+    return _rule_based_signal_explanation(deal, stock_data)
 
 def generate_signal_card(symbol: str, stock_data: dict, news: list) -> dict:
     """Generates a full NSE Signal Card for a stock ticker."""
