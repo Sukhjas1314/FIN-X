@@ -257,15 +257,17 @@ async def google_callback(request: Request, db: Session = Depends(get_db)):
         )
 
     email = user_info["email"].strip().lower()
+    name  = (user_info.get("name") or user_info.get("given_name") or "").strip() or None
     user  = get_user_by_email(db, email)
 
     if user is None:
         # First-time Google login → create pre-verified account
-        user = create_google_user(db, email)
-    elif not user.is_google_account and user.hashed_password:
-        # Email already registered via email/password — still issue tokens
-        # but mark that Google is now also linked
-        pass
+        user = create_google_user(db, email, name=name)
+    else:
+        # Update name if Google provides one and we don't have it yet
+        if name and not user.name:
+            user.name = name
+            db.commit()
 
     access  = create_access_token(user.id, user.email)
     refresh = create_refresh_token(user.id, user.email, user.refresh_token_version)

@@ -49,10 +49,11 @@ def create_email_user(db: Session, email: str, password: str) -> User:
     return user
 
 
-def create_google_user(db: Session, email: str) -> User:
+def create_google_user(db: Session, email: str, name: Optional[str] = None) -> User:
     """Creates a pre-verified Google OAuth user."""
     user = User(
         email=email.lower(),
+        name=name,
         hashed_password=None,
         is_verified=True,
         is_google_account=True,
@@ -109,7 +110,8 @@ def send_verification_email(to_email: str, token: str) -> dict:
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = "Verify your Fin-X account"
-    msg["From"] = f"Fin-X <{settings.SMTP_USER}>"
+    sender = settings.SMTP_FROM or settings.SMTP_USER
+    msg["From"] = f"Fin-X <{sender}>"
     msg["To"] = to_email
     msg.attach(MIMEText(html, "html"))
 

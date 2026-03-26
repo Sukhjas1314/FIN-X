@@ -79,6 +79,7 @@ class SignupResponse(BaseModel):
 class UserOut(BaseModel):
     id: str
     email: str
+    name: Optional[str] = None
     is_verified: bool
     is_google_account: bool
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from core.config import settings
@@ -52,4 +52,12 @@ def init_auth_db() -> None:
     """Creates all v2 auth tables (idempotent — safe to call on every startup)."""
     from models.user import User  # noqa: F401 — registers the model with Base
     Base.metadata.create_all(bind=engine)
+    # Migrate existing auth_users table: add name column if missing
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("ALTER TABLE auth_users ADD COLUMN name VARCHAR(255)"))
+            conn.commit()
+            print("[Auth v2] Migrated: added name column")
+        except Exception:
+            pass  # Column already exists — safe to ignore
     print("[Auth v2] DB tables ready")

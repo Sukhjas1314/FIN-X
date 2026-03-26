@@ -1,7 +1,9 @@
 # backend/main.py
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 import os
 from dotenv import load_dotenv
@@ -52,6 +54,19 @@ app.add_middleware(
     SessionMiddleware,
     secret_key=os.getenv('JWT_SECRET_KEY', 'dev-secret-change-me-in-production'),
 )
+
+# Security headers — applied to every response
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response: Response = await call_next(request)
+        response.headers['X-Content-Type-Options']  = 'nosniff'
+        response.headers['X-Frame-Options']          = 'DENY'
+        response.headers['X-XSS-Protection']         = '1; mode=block'
+        response.headers['Referrer-Policy']           = 'strict-origin-when-cross-origin'
+        response.headers['Permissions-Policy']        = 'geolocation=(), microphone=()'
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 # Mount all routers under /api prefix
 app.include_router(health.router,        prefix='/api', tags=['Health'])

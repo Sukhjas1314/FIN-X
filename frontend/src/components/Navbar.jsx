@@ -50,12 +50,23 @@ export default function Navbar({ active, onNav }) {
 
         {/* Right controls */}
         <div className="flex items-center gap-2 flex-shrink-0">
-          {/* User email pill */}
-          {user?.email && (
-            <span className="hidden lg:inline text-xs text-gray-500 dark:text-gray-400 bg-gray-100 dark:bg-gray-800 px-2.5 py-1 rounded-full border border-gray-200 dark:border-gray-700 max-w-[140px] truncate">
-              {user.email}
-            </span>
-          )}
+          {/* User avatar + name/email */}
+          {user && (() => {
+            const initials = user.name
+              ? user.name.split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2)
+              : (user.email?.[0] ?? '?').toUpperCase()
+            const label = user.name || user.email
+            return (
+              <div className="hidden lg:flex items-center gap-2">
+                <div className="w-7 h-7 rounded-full bg-gradient-to-br from-blue-600 to-violet-600 flex items-center justify-center flex-shrink-0">
+                  <span className="text-white text-[10px] font-bold leading-none">{initials}</span>
+                </div>
+                <span className="text-xs text-gray-500 dark:text-gray-400 bg-gray-100 dark:bg-gray-800 px-2.5 py-1 rounded-full border border-gray-200 dark:border-gray-700 max-w-[140px] truncate">
+                  {label}
+                </span>
+              </div>
+            )
+          })()}
 
           {/* Theme toggle */}
           <button

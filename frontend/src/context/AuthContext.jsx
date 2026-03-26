@@ -13,8 +13,9 @@ export function useAuth() {
 export default function AuthProvider({ children }) {
   const [accessToken, setAccessToken] = useState(() => localStorage.getItem(ACCESS_KEY) || null)
   const [user, setUser]               = useState(null)
+  const [isLoading, setIsLoading]     = useState(true)   // true until first session check completes
 
-  // ── Persist tokens to localStorage + sync to API client ──────────────────
+  // ── Persist tokens ────────────────────────────────────────────────────────
   const storeTokens = useCallback((access, refresh) => {
     setAccessToken(access)
     setAuthToken(access)
@@ -31,10 +32,10 @@ export default function AuthProvider({ children }) {
     setUser(null)
   }, [storeTokens])
 
-  // Register logout handler so the API refresh interceptor can call it
+  // Register logout handler so API refresh interceptor can call it on expiry
   useEffect(() => { setLogoutHandler(logout) }, [logout])
 
-  // On mount: seed the API client with whatever is already in localStorage
+  // On mount: seed API client from localStorage
   useEffect(() => {
     const access  = localStorage.getItem(ACCESS_KEY)
     const refresh = localStorage.getItem(REFRESH_KEY)
@@ -49,12 +50,18 @@ export default function AuthProvider({ children }) {
       setUser(me)
     } catch {
       logout()
+    } finally {
+      setIsLoading(false)
     }
   }, [logout])
 
-  // Restore session on initial load
+  // Restore session on initial load — clears loading when done
   useEffect(() => {
-    if (accessToken) fetchMe()
+    if (accessToken) {
+      fetchMe()
+    } else {
+      setIsLoading(false)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -68,8 +75,11 @@ export default function AuthProvider({ children }) {
     if (!access || !refresh) return
     window.history.replaceState({}, '', window.location.pathname)
     storeTokens(access, refresh)
-    api.get('/v2/auth/me').then(setUser).catch(() => logout())
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    api.get('/v2/auth/me')
+      .then(setUser)
+      .catch(() => logout())
+      .finally(() => setIsLoading(false))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // ── Context value ─────────────────────────────────────────────────────────
@@ -86,13 +96,13 @@ export default function AuthProvider({ children }) {
       return true
     }
 
-    // signup returns { registered, email_sent, verification_link }
+    // Returns { registered, email_sent, verification_link }
     const signup = async ({ email, password }) => {
       return await api.post('/v2/auth/signup', { email, password })
     }
 
-    return { accessToken, user, isAuthed, login, signup, logout, fetchMe }
-  }, [accessToken, user, logout, fetchMe, storeTokens])
+    return { accessToken, user, isAuthed, isLoading, login, signup, logout, fetchMe }
+  }, [accessToken, user, isLoading, logout, fetchMe, storeTokens])
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }

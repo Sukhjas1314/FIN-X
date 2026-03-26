@@ -29,8 +29,9 @@ class Settings(BaseSettings):
     # ── SMTP (Gmail App Password recommended) ────────────────
     SMTP_HOST: str = "smtp.gmail.com"
     SMTP_PORT: int = 587
-    SMTP_USER: str = ""   # your.address@gmail.com
-    SMTP_PASS: str = ""   # 16-char Gmail App Password
+    SMTP_USER: str = ""   # Brevo SMTP login (axxx@smtp-brevo.com)
+    SMTP_PASS: str = ""   # Brevo SMTP key
+    SMTP_FROM: str = ""   # Verified sender email shown in From header
 
     # ── URLs ─────────────────────────────────────────────────
     APP_URL: str = "http://localhost:5173"      # frontend

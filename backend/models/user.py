@@ -30,6 +30,8 @@ class User(Base):
         index=True,
     )
     email = Column(String(254), unique=True, nullable=False, index=True)
+    # Display name — populated from Google userinfo; null for email/password accounts
+    name  = Column(String(255), nullable=True)
 
     # ── Credentials ──────────────────────────────────────────
     # Nullable: Google-only accounts never have a password
