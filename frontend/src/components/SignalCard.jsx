@@ -1,6 +1,6 @@
 import { LineChart, Line, ResponsiveContainer, Tooltip } from 'recharts'
 import { AlertTriangle, TrendingUp, TrendingDown, Minus, ExternalLink, BarChart3 } from 'lucide-react'
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api'
 
@@ -61,6 +61,8 @@ function StatBox({ label, value, cls = '' }) {
 
 export default function SignalCard({ card }) {
   const [winRate, setWinRate] = useState(null) // { pct, n } | null
+  const [priceFlash, setPriceFlash] = useState(null) // 'up' | 'down' | null
+  const prevPriceRef = useRef(null)
 
   useEffect(() => {
     if (!card?.symbol) return
@@ -71,6 +73,18 @@ export default function SignalCard({ card }) {
       })
       .catch(() => {})
   }, [card?.symbol, card?.ema_signal])
+
+  // Flash price green/red whenever live price ticks
+  useEffect(() => {
+    const curr = card?.current_price
+    const prev = prevPriceRef.current
+    prevPriceRef.current = curr
+    if (prev == null || curr == null || prev === curr) return
+    const dir = curr > prev ? 'up' : 'down'
+    setPriceFlash(dir)
+    const t = setTimeout(() => setPriceFlash(null), 600)
+    return () => clearTimeout(t)
+  }, [card?.current_price])
 
   if (!card) return null
 
@@ -101,10 +115,13 @@ export default function SignalCard({ card }) {
           </div>
           {card.current_price != null && (
             <div className="flex items-baseline gap-2 mt-1">
-              <span className="text-2xl font-bold text-gray-900 dark:text-gray-100">
+              <span className={`text-2xl font-bold tabular-nums transition-colors duration-300
+                ${priceFlash === 'up' ? 'text-green-500 dark:text-green-400' :
+                  priceFlash === 'down' ? 'text-red-500 dark:text-red-400' :
+                  'text-gray-900 dark:text-gray-100'}`}>
                 ₹{Number(card.current_price).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
               </span>
-              <span className={`text-sm font-semibold ${isUp ? 'text-green-600 dark:text-green-500' : 'text-red-600 dark:text-red-500'}`}>
+              <span className={`text-sm font-semibold tabular-nums ${isUp ? 'text-green-600 dark:text-green-500' : 'text-red-600 dark:text-red-500'}`}>
                 {isUp ? '▲ +' : '▼ '}{card.change_pct != null ? card.change_pct : '—'}%
               </span>
             </div>

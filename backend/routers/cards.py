@@ -4,6 +4,8 @@ from fastapi.responses import JSONResponse
 from datetime import datetime, timedelta
 import math
 import json
+import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from database import db_fetchone, db_execute
 from services.indicators import get_stock_data
@@ -16,6 +18,26 @@ router = APIRouter()
 
 _MAX_SYMBOL_LEN = 10
 _FALLBACK_SNAPSHOT = 'Technical analysis unavailable.'
+
+# ── In-memory L1 card cache ───────────────────────────────────
+# Hot path: sub-millisecond for symbols warmed by scheduler or recent requests.
+# L1 (RAM) → L2 (SQLite) → fresh fetch + AI
+_mem_card: dict = {}           # symbol → {'card': dict, 'ts': float}
+_MEM_CARD_TTL = 15 * 60        # 15 min — mirrors DB cache TTL
+_mem_lock = threading.Lock()
+
+def _mem_get(symbol: str):
+    with _mem_lock:
+        e = _mem_card.get(symbol)
+        if e and (time.time() - e['ts']) < _MEM_CARD_TTL:
+            return e['card']
+        _mem_card.pop(symbol, None)
+        return None
+
+def _mem_set(symbol: str, card: dict):
+    """Write card to L1 cache. Called by endpoint and by scheduler prefetch."""
+    with _mem_lock:
+        _mem_card[symbol] = {'card': card, 'ts': time.time()}
 
 
 def _rule_based_snapshot(stock_data: dict) -> str:
@@ -151,7 +173,13 @@ def get_signal_card(symbol: str, force_refresh: bool = False):
             },
         )
 
-    # ── Cache check ──────────────────────────────────────────
+    # ── L1 cache check (sub-ms RAM hit) ─────────────────────
+    if not force_refresh:
+        mem = _mem_get(symbol)
+        if mem is not None:
+            return {'success': True, 'data': {'cached': True, 'card': mem}, 'error': None}
+
+    # ── L2 cache check (SQLite) ──────────────────────────────
     if not force_refresh:
         try:
             cached = db_fetchone(
@@ -159,9 +187,11 @@ def get_signal_card(symbol: str, force_refresh: bool = False):
                 (symbol,)
             )
             if cached and cached['expires_at'] > datetime.utcnow().isoformat():
+                card_obj = json.loads(cached['card_json'])
+                _mem_set(symbol, card_obj)   # promote DB hit → L1
                 return {
                     'success': True,
-                    'data': {'cached': True, 'card': json.loads(cached['card_json'])},
+                    'data': {'cached': True, 'card': card_obj},
                     'error': None,
                 }
         except Exception as e:
@@ -230,17 +260,33 @@ def get_signal_card(symbol: str, force_refresh: bool = False):
             if nse_quote.get(src_key) is not None:
                 stock_data[dst_key] = nse_quote[src_key]
 
-    # ── Guard: need at least a valid, positive price ────────
+    # ── Guard: if price unavailable, build a limited card rather than hard-fail ──
     cp = stock_data.get('current_price')
-    if cp is None or (isinstance(cp, float) and math.isnan(cp)) or (isinstance(cp, (int, float)) and cp <= 0):
-        return JSONResponse(
-            status_code=404,
-            content={
-                'success': False,
-                'data': None,
-                'error': f'Data temporarily unavailable for {symbol}. Please try again shortly.',
-            },
-        )
+    _price_unavailable = cp is None or (isinstance(cp, float) and math.isnan(cp)) or (isinstance(cp, (int, float)) and cp <= 0)
+    if _price_unavailable:
+        stock_data['current_price'] = None
+        stock_data.setdefault('change_pct', None)
+        # Provide a minimal fallback card so the UI shows something useful
+        limited_card = {
+            'symbol':              symbol,
+            'sentiment':           'neutral',
+            'sentiment_score':     50,
+            'sentiment_reason':    f'Live price data for {symbol} is temporarily unavailable (low liquidity / trading halt). Analysis based on available data only.',
+            'technical_snapshot':  f'Price feed unavailable for {symbol}. This may be due to trading suspension, very low liquidity, or a data provider outage. Check NSE directly for current status.',
+            'news_impact_score':   50,
+            'news_impact_summary': 'Unable to cross-reference news impact without a current price.',
+            'risk_flags':          ['Price data unavailable — exercise caution'],
+            'actionable_context':  f'Verify {symbol} trading status on NSE before acting. Stock may be suspended or illiquid.',
+            'disclaimer':          'For educational purposes only. Not financial advice.',
+            'current_price':       None,
+            'change_pct':          None,
+            'price_30d':           [],
+            'dates_30d':           [],
+            'news':                [{'headline': n['headline'], 'source': n['source'], 'url': n.get('url', '')} for n in news[:5]],
+            'trends':              {'1d': [], '1w': [], '1m': [], '5y': [], 'max': []},
+        }
+        _mem_set(symbol, limited_card)
+        return {'success': True, 'data': {'cached': False, 'card': limited_card}, 'error': None}
 
     # ── AI card generation ────────────────────────────────────
     try:
@@ -300,7 +346,8 @@ def get_signal_card(symbol: str, force_refresh: bool = False):
     }
     card['trends'] = trends
 
-    # ── Save to cache (15-min TTL) ────────────────────────────
+    # ── Save to L1 (RAM) + L2 (SQLite), 15-min TTL ──────────
+    _mem_set(symbol, card)
     try:
         expires = (datetime.utcnow() + timedelta(minutes=15)).isoformat()
         db_execute(

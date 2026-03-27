@@ -33,9 +33,11 @@ function TrendChart({ symbol, trends, liveIntraday, marketOpen }) {
   if (!trends) return null
 
   const key = TREND_KEYS[tab]
+  // For 1D: NEVER use trends['1d'] — card prefetch stores daily (not intraday) data there.
+  // Use WebSocket live intraday first, then API-fetched intraday, then empty (triggers fetch).
   const liveOrStored =
-    tab === '1D' && liveIntraday?.length >= 2
-      ? liveIntraday
+    tab === '1D'
+      ? (liveIntraday?.length >= 2 ? liveIntraday : (fetched['1d'] || []))
       : (fetched[key] || trends[key] || [])
 
   const raw = liveOrStored
@@ -74,8 +76,14 @@ function TrendChart({ symbol, trends, liveIntraday, marketOpen }) {
     let cancelled = false
     const loadTab = async () => {
       if (!symbol) return
-      const current = liveOrStored || []
-      if (current.length >= 2) return
+      if (tab === '1D') {
+        // Always fetch fresh intraday — don't rely on trends['1d'] which may be daily data
+        if ((fetched['1d'] || []).length >= 2) return  // already fetched this session
+        // fall through to fetch proper 5-min intraday
+      } else {
+        const current = fetched[key] || trends[key] || []
+        if (current.length >= 2) return
+      }
       try {
         setLoadingTab(true)
         const data = await fetchMarketChart(symbol, key)
@@ -183,17 +191,36 @@ function QuickPriceView({ symbol, liveData }) {
   const fmt  = (v) => v != null
     ? `₹${Number(v).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`
     : '—'
+  const prevPriceRef = useRef(null)
+  const [flash, setFlash] = useState(null)
+
+  useEffect(() => {
+    const curr = liveData?.price
+    const prev = prevPriceRef.current
+    prevPriceRef.current = curr
+    if (prev == null || curr == null || prev === curr) return
+    const dir = curr > prev ? 'up' : 'down'
+    setFlash(dir)
+    const t = setTimeout(() => setFlash(null), 600)
+    return () => clearTimeout(t)
+  }, [liveData?.price])
 
   return (
     <div className="space-y-4">
       {/* Price tile */}
-      <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-2xl p-5 shadow-sm">
+      <div className={`border rounded-2xl p-5 shadow-sm transition-colors duration-300
+        ${flash === 'up' ? 'bg-green-50 dark:bg-green-950/20 border-green-200 dark:border-green-800/50' :
+          flash === 'down' ? 'bg-red-50 dark:bg-red-950/20 border-red-200 dark:border-red-800/50' :
+          'bg-white dark:bg-gray-900 border-gray-200 dark:border-gray-800'}`}>
         <div className="flex items-start justify-between mb-4">
           <div>
             <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">NSE</p>
             <h2 className="text-2xl font-bold text-gray-900 dark:text-white">{symbol}</h2>
             <div className="flex items-baseline gap-2 mt-1">
-              <span className="text-3xl font-bold text-gray-900 dark:text-white tabular-nums">
+              <span className={`text-3xl font-bold tabular-nums transition-colors duration-300
+                ${flash === 'up' ? 'text-green-600 dark:text-green-400' :
+                  flash === 'down' ? 'text-red-600 dark:text-red-400' :
+                  'text-gray-900 dark:text-white'}`}>
                 {fmt(liveData?.price)}
               </span>
               <span className={`text-base font-semibold tabular-nums ${isUp ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
@@ -484,9 +511,9 @@ export default function CardPage({ initialSym = '' }) {
             <button
               onClick={() => {
                 activeSymRef.current = sym
-                setCard(null); setLive(null); setLoad(true)
-                fetchQuick(sym)
-                loadCard(sym, true)
+                _cardCache.delete(sym)   // bust frontend cache → forces backend fetch
+                loadCard(sym, false)     // use backend L1 cache if fresh, else regenerate
+                startWs(sym)            // reconnect WebSocket for immediate live data
               }}
               title="Force refresh"
               className="p-2 rounded-lg bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-500 hover:text-gray-900 dark:hover:text-white transition-colors"

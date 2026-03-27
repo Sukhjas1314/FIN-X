@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { TrendingUp, TrendingDown, DollarSign, Gem, RefreshCw, AlertCircle } from 'lucide-react'
+import { TrendingUp, TrendingDown, DollarSign, Gem, RefreshCw, AlertCircle, Zap } from 'lucide-react'
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api'
 
@@ -47,12 +47,29 @@ const SECTIONS = [
 
 function MoverCard({ stock, badgeCls, onSelect }) {
   const isUp = (stock.change_pct ?? 0) >= 0
+  const prevPriceRef = useRef(null)
+  const [flash, setFlash] = useState(null) // 'up' | 'down' | null
+
+  useEffect(() => {
+    const curr = stock.price
+    const prev = prevPriceRef.current
+    prevPriceRef.current = curr
+    if (prev == null || curr == null || prev === curr) return
+    const dir = curr > prev ? 'up' : 'down'
+    setFlash(dir)
+    const t = setTimeout(() => setFlash(null), 700)
+    return () => clearTimeout(t)
+  }, [stock.price])
+
   return (
     <button
       onClick={() => onSelect?.(stock.symbol)}
-      className="flex-shrink-0 w-40 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700
+      className={`flex-shrink-0 w-40 border border-gray-200 dark:border-gray-700
         rounded-xl p-3 text-left hover:border-blue-300 dark:hover:border-blue-600
-        hover:shadow-md transition-all duration-150 cursor-pointer group"
+        hover:shadow-md transition-all duration-300 cursor-pointer group
+        ${flash === 'up' ? 'bg-green-50 dark:bg-green-950/40 border-green-300 dark:border-green-800' :
+          flash === 'down' ? 'bg-red-50 dark:bg-red-950/40 border-red-300 dark:border-red-800' :
+          'bg-white dark:bg-gray-800'}`}
     >
       <div className="flex items-start justify-between mb-1.5">
         <span className="text-xs font-bold text-gray-900 dark:text-white group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
@@ -63,7 +80,12 @@ function MoverCard({ stock, badgeCls, onSelect }) {
         </span>
       </div>
       <p className="text-[10px] text-gray-400 truncate mb-2 leading-tight">{stock.name}</p>
-      <p className="text-sm font-bold text-gray-900 dark:text-gray-100">{fmt(stock.price)}</p>
+      <p className={`text-sm font-bold tabular-nums transition-colors duration-300
+        ${flash === 'up' ? 'text-green-600 dark:text-green-400' :
+          flash === 'down' ? 'text-red-600 dark:text-red-400' :
+          'text-gray-900 dark:text-gray-100'}`}>
+        {fmt(stock.price)}
+      </p>
     </button>
   )
 }
@@ -125,18 +147,17 @@ export default function MarketMovers({ onSelectStock }) {
 
   const fetchMovers = async (silent = false) => {
     if (!silent) setLoading(true)
-    setError(null)
     try {
       const res  = await fetch(`${API_BASE}/market/movers`)
       const json = await res.json()
       if (json.success && json.data) {
         setData(json.data)
+        setError(null)
         setLast(new Date())
-      } else {
-        setError(json.error || 'Failed to load movers')
       }
-    } catch (e) {
-      setError('Network error — check if backend is running')
+      // silent errors: keep existing data, don't show error banner
+    } catch {
+      // network blip — keep showing last known data silently
     } finally {
       setLoading(false)
     }
@@ -162,7 +183,7 @@ export default function MarketMovers({ onSelectStock }) {
   useEffect(() => {
     clearInterval(pollRef.current)
     fetchMovers()
-    const interval = marketOpen ? 5_000 : 60_000
+    const interval = marketOpen ? 3_000 : 60_000
     pollRef.current = setInterval(() => fetchMovers(true), interval)
     return () => clearInterval(pollRef.current)
   }, [marketOpen])
@@ -195,10 +216,18 @@ export default function MarketMovers({ onSelectStock }) {
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-base font-bold text-gray-900 dark:text-white">Market Movers</h2>
+          <div className="flex items-center gap-2">
+            <h2 className="text-base font-bold text-gray-900 dark:text-white">Market Movers</h2>
+            {marketOpen && data && (
+              <span className="flex items-center gap-1 text-[10px] font-semibold text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-950/30 px-1.5 py-0.5 rounded-full border border-green-200 dark:border-green-800/40">
+                <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse inline-block" />
+                LIVE
+              </span>
+            )}
+          </div>
           {lastFetch && data && (
             <p className="text-xs text-gray-400 mt-0.5">
-              {data.total} stocks · updated {lastFetch.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}
+              {data.total} stocks · {lastFetch.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
             </p>
           )}
         </div>

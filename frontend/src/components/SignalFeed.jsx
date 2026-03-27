@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { RefreshCw, TrendingUp, TrendingDown, Minus, Activity, ChevronDown, ChevronUp } from 'lucide-react'
 
 const RISK_STYLES = {
@@ -15,6 +15,8 @@ const SIG_ICON = {
 
 function SignalItem({ s }) {
   const [open, setOpen] = useState(false)
+  const [flash, setFlash] = useState(null) // 'up' | 'down' | null
+  const prevPriceRef = useRef(null)
   const risk   = s.risk_level || 'medium'
   const styles = RISK_STYLES[risk] || RISK_STYLES.medium
   const isUp   = (s.percent_change ?? 0) >= 0
@@ -23,6 +25,17 @@ function SignalItem({ s }) {
     try { return new Date(s.created_at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) }
     catch { return '' }
   })()
+
+  useEffect(() => {
+    const curr = s.price
+    const prev = prevPriceRef.current
+    prevPriceRef.current = curr
+    if (prev == null || curr == null || prev === curr) return
+    const dir = curr > prev ? 'up' : 'down'
+    setFlash(dir)
+    const t = setTimeout(() => setFlash(null), 600)
+    return () => clearTimeout(t)
+  }, [s.price])
 
   return (
     <div
@@ -46,11 +59,14 @@ function SignalItem({ s }) {
         <div className="flex items-center gap-3 flex-shrink-0">
           {hasPx && (
             <div className="text-right">
-              <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
-                ₹{Number(s.price).toLocaleString('en-IN')}
+              <p className={`text-sm font-bold tabular-nums transition-colors duration-300
+                ${flash === 'up' ? 'text-green-500 dark:text-green-400' :
+                  flash === 'down' ? 'text-red-500 dark:text-red-400' :
+                  'text-gray-900 dark:text-gray-100'}`}>
+                ₹{Number(s.price).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
               </p>
-              <p className={`text-xs font-semibold ${isUp ? 'text-green-600 dark:text-green-500' : 'text-red-600 dark:text-red-500'}`}>
-                {isUp ? '+' : ''}{s.percent_change ?? '—'}%
+              <p className={`text-xs font-semibold tabular-nums ${isUp ? 'text-green-600 dark:text-green-500' : 'text-red-600 dark:text-red-500'}`}>
+                {isUp ? '+' : ''}{s.percent_change != null ? Number(s.percent_change).toFixed(2) : '—'}%
               </p>
             </div>
           )}
@@ -101,7 +117,7 @@ function SkeletonItem() {
   )
 }
 
-export default function SignalFeed({ signals = [], loading, onRefresh, lastUpdated }) {
+export default function SignalFeed({ signals = [], loading, onRefresh, lastUpdated, marketOpen }) {
   const [filter, setFilter] = useState('all')
   const FILTERS = ['all', 'high', 'medium', 'low']
   const shown = filter === 'all' ? signals : signals.filter(s => s.risk_level === filter)
@@ -112,10 +128,18 @@ export default function SignalFeed({ signals = [], loading, onRefresh, lastUpdat
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-xl font-bold text-gray-900 dark:text-white">Opportunity Radar</h2>
+          <div className="flex items-center gap-2">
+            <h2 className="text-xl font-bold text-gray-900 dark:text-white">Opportunity Radar</h2>
+            {marketOpen && signals.length > 0 && (
+              <span className="flex items-center gap-1 text-[10px] font-semibold text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-950/30 px-1.5 py-0.5 rounded-full border border-green-200 dark:border-green-800/40">
+                <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse inline-block" />
+                LIVE
+              </span>
+            )}
+          </div>
           <p className="text-xs text-gray-500 mt-0.5">
             {lastUpdated
-              ? `Updated ${new Date(lastUpdated).toLocaleTimeString('en-IN')}`
+              ? `Updated ${new Date(lastUpdated).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`
               : 'NSE bulk & block deal signals'
             }
           </p>

@@ -11,6 +11,10 @@ import time
 
 router = APIRouter()
 
+# Short-lived in-memory cache — avoids hammering get_bulk_quotes on every frontend poll
+_sig_cache: dict = {}   # cache_key → {'data': list, 'ts': float}
+_SIG_CACHE_TTL = 4.5    # seconds — expires just before 5 s frontend poll; quote cache (15 s) always warm
+
 
 @router.get('/signals')
 def get_signals(
@@ -20,6 +24,11 @@ def get_signals(
 ):
     """Returns latest AI-explained signals from the Opportunity Radar."""
     try:
+        cache_key = f'{limit}:{risk_level}:{symbol}'
+        cached = _sig_cache.get(cache_key)
+        if cached and (time.time() - cached['ts']) < _SIG_CACHE_TTL:
+            return {'success': True, 'data': {'signals': cached['data']}, 'error': None}
+
         query      = 'SELECT * FROM signals'
         params     = []
         conditions = []
@@ -89,6 +98,7 @@ def get_signals(
             except Exception as e:
                 print(f'[Signals] Stale explanation fix failed: {e}')
 
+        _sig_cache[cache_key] = {'data': signals, 'ts': time.time()}
         return {'success': True, 'data': {'signals': signals}, 'error': None}
     except Exception as e:
         return JSONResponse(

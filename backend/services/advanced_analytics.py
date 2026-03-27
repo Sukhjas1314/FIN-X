@@ -102,40 +102,51 @@ def get_pattern_success_rate(symbol: str, signal_type: str) -> dict:
         _cache_set(cache_key, result)
         return result
 
+_clusters_cache: dict = {}
+_CLUSTERS_TTL = 5 * 60  # 5 minutes
+
+
 def get_institutional_clusters() -> dict:
     """
-    Queries bulk_deals within the last 7 days.
-    Groups by sector, and flags if >= 3 diff institutions entered same sector.
+    Queries bulk_deals within the last 30 days.
+    Groups by sector, flags if >= 2 different institutions entered same sector.
+    Cached in-memory for 5 minutes.
     """
+    cached = _clusters_cache.get('clusters')
+    if cached and (_time.time() - cached['ts']) < _CLUSTERS_TTL:
+        return cached['data']
+
     try:
-        cutoff = (datetime.utcnow() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
-        query = "SELECT symbol, client_name, deal_type FROM bulk_deals WHERE fetched_at >= ? OR deal_date >= ?"
-        # Alternatively, if deal_date is more reliable:
-        # Note: deal_date might just be YYYY-MM-DD
-        deals = db_fetchall(query, (cutoff, (datetime.utcnow() - timedelta(days=7)).strftime('%Y-%m-%d')))
-        
-        # Aggregate by sector
+        cutoff_dt = datetime.utcnow() - timedelta(days=30)
+        cutoff_str = cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')
+        cutoff_date = cutoff_dt.strftime('%Y-%m-%d')
+        deals = db_fetchall(
+            "SELECT symbol, client_name, deal_type FROM bulk_deals WHERE fetched_at >= ? OR deal_date >= ?",
+            (cutoff_str, cutoff_date)
+        )
+
         sector_institutions = {}
         for d in deals:
             sym = d["symbol"].upper().replace(".NS", "")
             sector = SECTORS.get(sym, "Other")
             client = d.get("client_name", "Unknown")
-            
             if sector not in sector_institutions:
                 sector_institutions[sector] = set()
             sector_institutions[sector].add(client)
-        
+
         clusters = []
-        for sector, clients in sector_institutions.items():
-            if len(clients) >= 3:
+        for sector, clients in sorted(sector_institutions.items(), key=lambda x: -len(x[1])):
+            if len(clients) >= 2:
                 clusters.append({
                     "sector": sector,
                     "institution_count": len(clients),
                     "flag": "High Conviction Sector Cluster",
-                    "clients": list(clients)[:5] # Show up to 5
+                    "clients": list(clients)[:5]
                 })
-        
-        return {"clusters": clusters}
+
+        result = {"clusters": clusters}
+        _clusters_cache['clusters'] = {'data': result, 'ts': _time.time()}
+        return result
     except Exception as e:
         print(f"[Analytics] Error in get_institutional_clusters: {e}")
         return {"error": str(e), "clusters": []}

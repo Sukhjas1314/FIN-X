@@ -130,6 +130,33 @@ def fetch_current_price(symbol: str) -> DataFetchResult:
     if not sym:
         return DataFetchResult("unavailable", "none", None, None)
 
+    # 0) Cache-first: use nse_service in-memory quote cache (warmed every 1s by scheduler)
+    try:
+        import time as _t
+        from services.nse_service import _quote_cache, _cache_lock, QUOTE_TTL
+        with _cache_lock:
+            entry = _quote_cache.get(sym)
+        if entry and (_t.time() - entry[0]) < QUOTE_TTL:
+            q = entry[1]
+            if q and _validate_price(q.get("price")):
+                ts = q.get("timestamp") or _now_utc_iso()
+                return DataFetchResult(
+                    freshness="fresh",
+                    source="nse_quote",
+                    timestamp=ts,
+                    payload={
+                        "current_price": q.get("price"),
+                        "change_pct":    q.get("percent_change"),
+                        "open":          q.get("open"),
+                        "high":          q.get("high"),
+                        "low":           q.get("low"),
+                        "prev_close":    q.get("prev_close"),
+                        "volume":        q.get("volume"),
+                    },
+                )
+    except Exception:
+        pass
+
     # 1) Primary: NSE quote-equity (session warmed) via nse_service internals.
     try:
         raw = nse_service._fetch_nse_quote_raw(sym)  # noqa: SLF001
@@ -204,6 +231,27 @@ def fetch_close_series(symbol: str, window_days: int = 120) -> DataFetchResult:
     sym = _normalize_symbol(symbol)
     if not sym:
         return DataFetchResult("unavailable", "none", None, None)
+
+    # 0) Cache-first: serve from DB if data is fresh (avoids expensive external calls)
+    cached = _read_close_series_cache(sym)
+    if cached:
+        ts = cached.get("series_ts") or cached.get("updated_at")
+        age = _age_seconds(ts)
+        if age is not None and age < _FRESH_SECONDS:
+            try:
+                series_json = json.loads(cached.get("series_json") or "null") or {}
+                closes = series_json.get("closes") or []
+                dates  = series_json.get("dates")  or []
+                if len(closes) >= 50:
+                    series_json["timestamp"] = ts
+                    return DataFetchResult(
+                        freshness="fresh",
+                        source="stale_cache",
+                        timestamp=ts,
+                        payload=series_json,
+                    )
+            except Exception:
+                pass
 
     # 1) Alpha Vantage daily series (attempt multiple symbol forms)
     alpha_series = _alpha_vantage_daily_series_any(sym)

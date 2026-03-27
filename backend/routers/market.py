@@ -16,7 +16,7 @@ router = APIRouter()
 
 # ── In-memory movers cache ────────────────────────────────────
 _cache: dict = {}
-_CACHE_TTL_OPEN   =  5   # seconds — during market hours (aggressive refresh)
+_CACHE_TTL_OPEN   = 10   # seconds — scheduler rewrites every 3 s; 10 s TTL prevents cold gaps
 _CACHE_TTL_CLOSED = 120  # seconds — after market close (stale is fine)
 _CHART_CACHE_TTL = 2     # short-lived cache for repeated chart requests
 
@@ -197,8 +197,11 @@ async def market_ws(symbol: str, websocket: WebSocket):
 
         while True:
             register_hot_symbol(norm)
-            quote = await asyncio.to_thread(get_quote, norm)
-            intraday = await asyncio.to_thread(get_historical, norm, '1d')
+            # Fetch quote and intraday in parallel — both are cache-first so < 5 ms each
+            quote, intraday = await asyncio.gather(
+                asyncio.to_thread(get_quote, norm),
+                asyncio.to_thread(get_historical, norm, '1d'),
+            )
             status = market_status()
 
             payload = {
@@ -221,7 +224,7 @@ async def market_ws(symbol: str, websocket: WebSocket):
                 'error': None,
             }
             await websocket.send_text(json.dumps(payload))
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)  # push every 1 s — always from warm cache, zero NSE calls
     except WebSocketDisconnect:
         return
     except Exception:

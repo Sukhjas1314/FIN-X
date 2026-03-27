@@ -281,10 +281,16 @@ def prefetch_popular_stocks():
             card = generate_signal_card(symbol, stock, news)
             dates  = stock.get('dates_30d', [])
             prices = stock.get('price_30d', [])
+            # Fetch real 5-min intraday so trends['1d'] is never stale daily data
+            try:
+                from services.nse_service import get_historical as _gh
+                intraday_points = _gh(symbol, '1d') or []
+            except Exception:
+                intraday_points = []
             trends = {
                 '1m': [{'time': d, 'price': p} for d, p in zip(dates, prices)],
                 '1w': [{'time': d, 'price': p} for d, p in zip(dates[-7:],  prices[-7:])],
-                '1d': [{'time': d, 'price': p} for d, p in zip(dates[-5:],  prices[-5:])],
+                '1d': intraday_points,   # proper 5-min intraday, not daily close data
             }
             card.update({
                 'price_30d':     prices,
@@ -306,52 +312,72 @@ def prefetch_popular_stocks():
                 'INSERT OR REPLACE INTO card_cache (symbol, card_json, expires_at) VALUES (?,?,?)',
                 (symbol, json.dumps(card), expires)
             )
+            # Also warm L1 in-memory cache so first request is sub-ms
+            try:
+                from routers.cards import _mem_set
+                _mem_set(symbol, card)
+            except Exception:
+                pass
             logger.info(f'Pre-fetched card: {symbol}')
             time.sleep(3)
         except Exception as e:
             logger.error(f'Pre-fetch failed for {symbol}: {e}')
 
 
+def _get_signal_symbols() -> list:
+    """Returns unique symbols from the latest signals (for price pre-warming)."""
+    try:
+        from database import db_fetchall
+        rows = db_fetchall('SELECT DISTINCT symbol FROM signals ORDER BY created_at DESC LIMIT 30')
+        return [r['symbol'] for r in rows if r.get('symbol')]
+    except Exception:
+        return []
+
+
 def refresh_live_quotes():
     """
-    Pre-warm the in-memory quote cache for all 50 movers symbols.
-    Runs every 1-2 seconds via APScheduler. No-op outside market hours.
-    Parallel fetch (ThreadPoolExecutor in get_bulk_quotes) keeps this fast.
-    max_instances=1 prevents overlapping runs if NSE is slow.
-    Also warms the intraday cache so /market/live and /market/price
-    respond instantly (< 10 ms) for all popular symbols.
+    Refresh all Nifty 50 quotes every 2 s.
+    Primary: 1 NSE batch call → all 50 symbols.
+    Fallback: Yahoo Finance batch if NSE returns < 10 results (rate-limited / down).
+    Also batches signal symbols + hot symbols (user-searched) via Yahoo.
     """
     try:
         from services.market_hours import is_market_open
         if not is_market_open():
-            return   # no-op outside market hours
-        from services.nse_service import get_bulk_quotes, get_historical, get_hot_symbols
+            return
+        from services.nse_service import (
+            get_nifty50_batch, get_yahoo_batch, get_historical,
+            get_hot_symbols, get_bulk_quotes,
+        )
         from concurrent.futures import ThreadPoolExecutor
-        global _live_cursor
 
+        # Primary: 1 NSE API call → all 50 Nifty 50 quotes
+        updated = get_nifty50_batch()
+        logger.debug(f'[LiveQuotes] NSE batch: {updated} symbols')
+
+        # Fallback: Yahoo batch if NSE batch returned too few (403 / outage)
+        if updated < 10:
+            y = get_yahoo_batch(_LIVE_SYMBOLS)
+            logger.debug(f'[LiveQuotes] Yahoo fallback batch: {y} symbols')
+
+        # Batch-refresh signal symbols + hot symbols via Yahoo (1 call for all)
+        nifty_set = set(_LIVE_SYMBOLS)
         hot = get_hot_symbols(limit=10)
-        # Round-robin through baseline symbols to avoid hitting all 50 every cycle.
-        chunk_size = 12
-        start = _live_cursor % len(_LIVE_SYMBOLS)
-        cold_chunk = [_LIVE_SYMBOLS[(start + i) % len(_LIVE_SYMBOLS)] for i in range(chunk_size)]
-        _live_cursor = (start + chunk_size) % len(_LIVE_SYMBOLS)
-        symbols_to_warm = list(dict.fromkeys(hot + cold_chunk))
+        sig_syms = _get_signal_symbols()
+        extra = list({s for s in (hot + sig_syms) if s not in nifty_set})
+        if extra:
+            get_yahoo_batch(extra[:50])   # single Yahoo batch call for all extras
 
-        # Warm quote cache for active symbols + rotating baseline set.
-        get_bulk_quotes(symbols_to_warm)
+        # Warm intraday cache for actively viewed symbols
+        hot5 = get_hot_symbols(limit=5)
+        if hot5:
+            def _wi(s):
+                try: get_historical(s, '1d')
+                except: pass
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                for sym in hot5:
+                    ex.submit(_wi, sym)
 
-        # Warm intraday cache for the hottest symbols first.
-        def _warm_intraday(sym):
-            try:
-                get_historical(sym, '1d')
-            except Exception:
-                pass
-
-        with ThreadPoolExecutor(max_workers=5) as ex:
-            for sym in symbols_to_warm[:10]:
-                ex.submit(_warm_intraday, sym)
-
-        logger.debug(f'[LiveQuotes] Cache warmed for {len(symbols_to_warm)} symbols')
     except Exception as e:
         logger.warning(f'[LiveQuotes] Refresh error: {e}')
 
@@ -446,6 +472,42 @@ def start_scheduler():
         replace_existing = True,
     )
 
+    # Batch-fetch all Nifty 50 + signal symbols at startup
+    def _startup_batch():
+        try:
+            from services.nse_service import get_nifty50_batch, get_yahoo_batch
+            n = get_nifty50_batch()
+            logger.info(f'[Startup] NSE batch pre-warmed {n} Nifty 50 quotes')
+            if n < 10:
+                n2 = get_yahoo_batch(_LIVE_SYMBOLS)
+                logger.info(f'[Startup] Yahoo fallback pre-warmed {n2} quotes')
+            # Also pre-warm signal symbols (non-Nifty-50) via Yahoo batch
+            sig_syms = _get_signal_symbols()
+            nifty_set = set(_LIVE_SYMBOLS)
+            extra = [s for s in sig_syms if s not in nifty_set]
+            if extra:
+                n3 = get_yahoo_batch(extra[:50])
+                logger.info(f'[Startup] Signal symbols pre-warmed {n3} quotes')
+        except Exception as e:
+            logger.warning(f'[Startup] Batch warm failed: {e}')
+
+    scheduler.add_job(
+        _startup_batch,
+        trigger          = 'date',
+        run_date         = dt.datetime.now() + dt.timedelta(seconds=5),
+        id               = 'batch_startup_warm',
+        replace_existing = True,
+    )
+
+    # Warm movers cache at startup so Radar page loads instantly on first visit.
+    scheduler.add_job(
+        refresh_movers_cache,
+        trigger          = 'date',
+        run_date         = dt.datetime.now() + dt.timedelta(seconds=10),
+        id               = 'movers_startup_warm',
+        replace_existing = True,
+    )
+
     # First-run warmup job (demo UX): run after prefetch_popular_stocks kicks in.
     scheduler.add_job(
         warmup_seed_if_needed,
@@ -464,8 +526,8 @@ def start_scheduler():
         replace_existing = True,
     )
 
-    live_refresh_seconds = max(1, int(os.getenv('LIVE_REFRESH_SECONDS', '2')))
-    movers_refresh_seconds = max(2, int(os.getenv('MOVERS_REFRESH_SECONDS', '3')))
+    live_refresh_seconds   = max(2, int(os.getenv('LIVE_REFRESH_SECONDS',   '2')))   # batch NSE call every 2 s
+    movers_refresh_seconds = max(2, int(os.getenv('MOVERS_REFRESH_SECONDS', '3')))   # movers rebuild every 3 s (all cache hits)
 
     # Live quote cache warmer — all 50 movers symbols
     scheduler.add_job(

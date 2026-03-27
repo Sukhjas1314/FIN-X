@@ -7,15 +7,35 @@ export default function ClusterRadar() {
   const [clusters, setClusters] = useState([])
   const [loading,  setLoading]  = useState(true)
 
-  useEffect(() => {
+  const fetchClusters = () => {
     fetch(`${API_BASE}/analytics/clusters`)
       .then(r => r.json())
-      .then(data => { if (data.clusters) setClusters(data.clusters) })
-      .catch(e => console.error('[ClusterRadar]', e))
-      .finally(() => setLoading(false))
+      .then(data => {
+        const fresh = data.clusters || []
+        if (fresh.length > 0) setClusters(fresh)
+        setLoading(false)
+      })
+      .catch(e => { console.error('[ClusterRadar]', e); setLoading(false) })
+  }
+
+  useEffect(() => {
+    fetchClusters()
+    const t = setInterval(fetchClusters, 60_000)
+    return () => clearInterval(t)
   }, [])
 
-  if (loading || clusters.length === 0) return null
+  if (loading && clusters.length === 0) {
+    return (
+      <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-2xl p-5 shadow-sm animate-pulse">
+        <div className="h-5 w-64 bg-gray-200 dark:bg-gray-700 rounded mb-4" />
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {[1,2].map(i => <div key={i} className="h-24 bg-gray-100 dark:bg-gray-800 rounded-xl" />)}
+        </div>
+      </div>
+    )
+  }
+
+  if (!loading && clusters.length === 0) return null
 
   return (
     <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-2xl p-5 shadow-sm">

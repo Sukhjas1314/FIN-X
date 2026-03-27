@@ -36,6 +36,37 @@ _EQ_HEADERS = {
 _eq_session: _requests.Session | None = None
 _eq_lock = threading.Lock()
 
+# ── Yahoo Finance authenticated session (crumb-based) ─────────
+_yahoo_session: _requests.Session | None = None
+_yahoo_crumb:   str | None = None
+_yahoo_lock = threading.Lock()
+
+def _get_yahoo_session():
+    """Return a Yahoo Finance session with valid crumb for v7 API auth."""
+    global _yahoo_session, _yahoo_crumb
+    with _yahoo_lock:
+        if _yahoo_session and _yahoo_crumb:
+            return _yahoo_session, _yahoo_crumb
+        s = _requests.Session()
+        s.headers.update({"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip, deflate"})
+        try:
+            s.get("https://finance.yahoo.com/", timeout=8)
+            crumb = s.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=5).text.strip()
+            _yahoo_session = s
+            _yahoo_crumb   = crumb
+            print(f"[Yahoo] Session initialised, crumb={crumb[:6]}...")
+        except Exception as e:
+            print(f"[Yahoo] Session init failed: {e}")
+            _yahoo_session = s
+            _yahoo_crumb   = ""
+        return _yahoo_session, _yahoo_crumb
+
+def _reset_yahoo_session():
+    global _yahoo_session, _yahoo_crumb
+    with _yahoo_lock:
+        _yahoo_session = None
+        _yahoo_crumb   = None
+
 
 def _get_eq_session() -> _requests.Session:
     """Return (or create) a warmed-up session for the equity-quote endpoint."""
@@ -68,9 +99,9 @@ _quote_cache: dict = {}   # {symbol: (timestamp, data)}
 _hist_cache:  dict = {}   # {"symbol_period": (timestamp, data)}
 _cache_lock   = threading.Lock()
 _hot_symbols: dict[str, float] = {}  # {symbol: last_requested_ts}
-QUOTE_TTL       = max(1, int(os.getenv("QUOTE_TTL_SECONDS", "2")))   # seconds
+QUOTE_TTL       = max(1, int(os.getenv("QUOTE_TTL_SECONDS", "15")))  # seconds — scheduler writes every 2s; 15s TTL prevents cold-cache gaps
 HIST_TTL        = max(10, int(os.getenv("HIST_TTL_SECONDS", "60")))  # seconds
-HIST_TTL_1D_OPEN   =  max(1, int(os.getenv("HIST_TTL_1D_OPEN_SECONDS", "2")))  # seconds
+HIST_TTL_1D_OPEN   =  max(1, int(os.getenv("HIST_TTL_1D_OPEN_SECONDS", "8")))  # seconds — intraday during market hours
 HIST_TTL_1D_CLOSED = 300 # seconds — intraday cache after market close
 HOT_SYMBOL_TTL_SECONDS = max(10, int(os.getenv("HOT_SYMBOL_TTL_SECONDS", "180")))
 MAX_HOT_SYMBOLS = max(5, int(os.getenv("MAX_HOT_SYMBOLS", "20")))
@@ -162,10 +193,81 @@ def _downsample_points(points: list[dict], max_points: int) -> list[dict]:
     return [points[i] for i in sorted(idxs)]
 
 
+# ── NSE Batch fetch (Nifty 50 in ONE call) ────────────────────
+def get_nifty50_batch(_retry: int = 0) -> int:
+    """
+    Fetch ALL Nifty 50 quotes in a SINGLE NSE API call using the index endpoint.
+    Writes directly into _quote_cache. Returns count of symbols updated.
+
+    This replaces 50 individual calls with 1 — eliminates rate limiting entirely.
+    """
+    if _retry >= 2:
+        return 0
+    session = _get_eq_session()
+    try:
+        resp = session.get(
+            f"{NSE_BASE}/api/equity-stockIndices",
+            params={"index": "NIFTY 50"},
+            timeout=8,
+        )
+        if resp.status_code == 403:
+            print(f"[NSE-Batch] 403 — resetting session (attempt {_retry+1}/2)")
+            _reset_eq_session()
+            time.sleep(1)
+            return get_nifty50_batch(_retry + 1)
+        if resp.status_code in (400, 404):
+            return 0
+        resp.raise_for_status()
+        if not resp.content:
+            return 0
+        data = resp.json()
+        items = data.get("data", [])
+        if not isinstance(items, list):
+            return 0
+
+        def _f(v):
+            try: return round(float(v), 2) if v is not None else None
+            except (TypeError, ValueError): return None
+
+        def _i(v):
+            try: return int(v) if v is not None else None
+            except (TypeError, ValueError): return None
+
+        now = time.time()
+        updated = 0
+        with _cache_lock:
+            for item in items:
+                sym = (item.get("symbol") or "").upper().strip()
+                if not _is_valid_symbol(sym):
+                    continue
+                price = _f(item.get("lastPrice"))
+                if not price or price <= 0:
+                    continue
+                quote = {
+                    "symbol":         sym,
+                    "price":          price,
+                    "change":         _f(item.get("change")),
+                    "percent_change": _f(item.get("pChange")),
+                    "open":           _f(item.get("open")),
+                    "high":           _f(item.get("dayHigh")),
+                    "low":            _f(item.get("dayLow")),
+                    "prev_close":     _f(item.get("previousClose") or item.get("prevClose")),
+                    "volume":         _i(item.get("totalTradedVolume")),
+                    "timestamp":      datetime.datetime.utcnow().isoformat(),
+                    "raw_data":       None,
+                }
+                _quote_cache[sym] = (now, quote)
+                updated += 1
+        return updated
+    except Exception as e:
+        print(f"[NSE-Batch] Error: {e}")
+        return 0
+
+
 # ── NSE API fetch ─────────────────────────────────────────────
 def _fetch_nse_quote_raw(symbol: str, _retry: int = 0) -> Optional[dict]:
     """Fetch raw JSON from NSE quote-equity endpoint. Returns None on any failure."""
-    if _retry >= 3:
+    if _retry >= 2:
         print(f"[NSE] Max retries reached for {symbol}")
         return None
     session = _get_eq_session()
@@ -173,12 +275,12 @@ def _fetch_nse_quote_raw(symbol: str, _retry: int = 0) -> Optional[dict]:
         resp = session.get(
             f"{NSE_BASE}/api/quote-equity",
             params={"symbol": symbol},
-            timeout=8,
+            timeout=5,
         )
         if resp.status_code == 403:
-            print(f"[NSE] 403 for {symbol} — resetting equity session (attempt {_retry + 1}/3)")
+            print(f"[NSE] 403 for {symbol} — resetting equity session (attempt {_retry + 1}/2)")
             _reset_eq_session()
-            time.sleep(1)
+            time.sleep(0.3)
             return _fetch_nse_quote_raw(symbol, _retry + 1)
         if resp.status_code in (404, 400):
             return None
@@ -230,73 +332,164 @@ def _normalize_quote(symbol: str, raw: dict) -> dict:
     }
 
 
-# ── yfinance fallback ─────────────────────────────────────────
+# ── Yahoo Finance v7 single-symbol quote (fast path) ──────────
 def _yahoo_fallback(symbol: str) -> Optional[dict]:
     """
-    Fallback using direct Yahoo Finance chart API.
-    Does NOT use yfinance library (which has Brotli decode issues).
+    Yahoo Finance chart API fallback — no auth required.
+    Tries .NS suffix first (NSE), then .BO (BSE) for stocks not on Yahoo NS
+    (e.g. SPICEJET which is only listed on Yahoo as SPICEJET.BO).
     """
-    try:
-        resp = _requests.get(
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.NS",
-            params={"range": "2d", "interval": "1d"},
-            headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip, deflate"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("chart", {}).get("error"):
-            return None
-        result = (data.get("chart", {}).get("result") or [None])[0]
-        if not result:
-            return None
-
+    # ── chart API, try .NS then .BO (covers all listed stocks) ──
+    def _parse_chart(resp_json, sym):
+        result = (resp_json.get("chart", {}).get("result") or [None])[0]
+        if not result: return None
         meta   = result.get("meta") or {}
         quotes = ((result.get("indicators") or {}).get("quote") or [{}])[0]
-
-        ltp        = meta.get("regularMarketPrice")
+        ltp    = meta.get("regularMarketPrice")
+        if ltp is None: return None
         prev_close = meta.get("chartPreviousClose") or meta.get("previousClose")
-        opens      = quotes.get("open",   [])
-        highs      = quotes.get("high",   [])
-        lows       = quotes.get("low",    [])
-        volumes    = quotes.get("volume", [])
-
-        if ltp is None:
-            return None
-
-        ltp        = float(ltp)
-        change     = round(ltp - float(prev_close), 2) if prev_close else 0
-        pchange    = round((change / float(prev_close)) * 100, 2) if prev_close else 0
-
+        ltp = float(ltp)
+        change  = round(ltp - float(prev_close), 2) if prev_close else 0
+        pchange = round((change / float(prev_close)) * 100, 2) if prev_close else 0
         def _last(lst):
             vals = [v for v in lst if v is not None]
             return round(float(vals[-1]), 2) if vals else None
-
+        volumes = quotes.get("volume", [])
         return {
-            "symbol":         symbol.upper(),
+            "symbol":         sym.upper(),
             "price":          round(ltp, 2),
             "change":         change,
             "percent_change": pchange,
-            "open":           _last(opens),
-            "high":           _last(highs),
-            "low":            _last(lows),
+            "open":           _last(quotes.get("open",  [])),
+            "high":           _last(quotes.get("high",  [])),
+            "low":            _last(quotes.get("low",   [])),
             "prev_close":     round(float(prev_close), 2) if prev_close else None,
             "volume":         int(volumes[-1]) if volumes and volumes[-1] else None,
             "timestamp":      datetime.datetime.utcnow().isoformat(),
             "raw_data":       None,
         }
-    except Exception as e:
-        print(f"[Yahoo] Fallback error for {symbol}: {e}")
-        return None
+
+    for suffix in [".NS", ".BO"]:
+        try:
+            resp = _requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}{suffix}",
+                params={"range": "2d", "interval": "1d"},
+                headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip, deflate"},
+                timeout=6,
+            )
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("chart", {}).get("error"):
+                continue
+            result = _parse_chart(data, symbol)
+            if result:
+                return result
+        except Exception:
+            continue
+
+    print(f"[Yahoo] All fallbacks exhausted for {symbol}")
+    return None
+
+
+# ── Yahoo Finance batch quote (spark API — no auth required) ─────────────────
+def get_yahoo_batch(symbols: list) -> int:
+    """
+    Batch-fetch current quotes from Yahoo Finance spark API.
+    One HTTP call for up to 50 symbols — no auth/crumb required.
+    Returns count of symbols written to _quote_cache.
+    Tries .NS suffix first; any missing symbols retried with .BO (e.g. SPICEJET).
+    """
+    if not symbols:
+        return 0
+
+    def _f(v):
+        try: return round(float(v), 2) if v is not None else None
+        except: return None
+
+    def _spark_call(sym_list: list) -> dict:
+        """Single spark API call → {SYMBOL.NS: {...}, ...}"""
+        if not sym_list:
+            return {}
+        try:
+            resp = _requests.get(
+                "https://query1.finance.yahoo.com/v8/finance/spark",
+                params={"symbols": ",".join(sym_list), "range": "1d", "interval": "1d"},
+                headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip, deflate"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return resp.json() or {}
+        except Exception as e:
+            print(f"[Yahoo-Batch] spark error: {e}")
+            return {}
+
+    batch = symbols[:50]
+    _CHUNK = 20  # spark API limit
+
+    # Phase A: try all with .NS, chunked to ≤20 per call
+    data = {}
+    for i in range(0, len(batch), _CHUNK):
+        ns_syms = [f"{s}.NS" for s in batch[i:i + _CHUNK]]
+        data.update(_spark_call(ns_syms))
+
+    # Phase B: for any not found in .NS response, retry with .BO
+    found_base = {k.replace(".NS", "").replace(".BO", "") for k in data}
+    missing_bo = [s for s in batch if s not in found_base]
+    if missing_bo:
+        for i in range(0, len(missing_bo), _CHUNK):
+            bo_data = _spark_call([f"{s}.BO" for s in missing_bo[i:i + _CHUNK]])
+            data.update(bo_data)
+
+    if not data:
+        return 0
+
+    now = time.time()
+    updated = 0
+    with _cache_lock:
+        for raw_sym, item in data.items():
+            sym = raw_sym.replace(".NS", "").replace(".BO", "").upper()
+            if not _is_valid_symbol(sym):
+                continue
+            closes = item.get("close") or []
+            price = _f(closes[-1]) if closes else None
+            if not price or price <= 0:
+                continue
+            prev_close = _f(item.get("chartPreviousClose") or item.get("previousClose"))
+            if prev_close and prev_close > 0:
+                change     = round(price - prev_close, 2)
+                pct_change = round((change / prev_close) * 100, 2)
+            else:
+                change, pct_change = None, None
+            quote = {
+                "symbol":         sym,
+                "price":          price,
+                "change":         change,
+                "percent_change": pct_change,
+                "open":           None,
+                "high":           None,
+                "low":            None,
+                "prev_close":     prev_close,
+                "volume":         None,
+                "timestamp":      datetime.datetime.utcnow().isoformat(),
+                "raw_data":       None,
+            }
+            _quote_cache[sym] = (now, quote)
+            updated += 1
+    return updated
 
 
 # ── Public: get_quote ─────────────────────────────────────────
 def get_quote(symbol: str) -> Optional[dict]:
     """
     Get live NSE quote for a symbol.
-    Pipeline: cache → NSE API → yfinance → None
+    Cache-first. On cache miss: NSE and Yahoo run in PARALLEL — returns
+    whichever responds first with a valid price (usually < 500 ms).
     Never raises. Returns None if all sources fail.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _asc
+
     symbol = symbol.upper().strip().replace(".NS", "").replace(".BO", "")
     if not _is_valid_symbol(symbol):
         return None
@@ -308,17 +501,28 @@ def get_quote(symbol: str) -> Optional[dict]:
         if entry and (now - entry[0]) < QUOTE_TTL:
             return entry[1]
 
-    # Try NSE API
-    raw = _fetch_nse_quote_raw(symbol)
-    if raw and isinstance(raw.get("priceInfo"), dict):
-        result = _normalize_quote(symbol, raw)
-        with _cache_lock:
-            _quote_cache[symbol] = (time.time(), result)
-        return result
+    # Parallel: NSE (accurate, real-time) vs Yahoo (faster, reliable fallback)
+    def _nse():
+        raw = _fetch_nse_quote_raw(symbol)
+        if raw and isinstance(raw.get("priceInfo"), dict):
+            return _normalize_quote(symbol, raw)
+        return None
 
-    # Fallback to direct Yahoo Finance API
-    print(f"[NSE] API miss for {symbol} — falling back to Yahoo Finance")
-    result = _yahoo_fallback(symbol)
+    result = None
+    try:
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futures = [ex.submit(_nse), ex.submit(_yahoo_fallback, symbol)]
+            for f in _asc(futures, timeout=8):
+                try:
+                    r = f.result()
+                    if r and r.get("price") is not None and float(r.get("price", 0)) > 0:
+                        result = r
+                        break
+                except Exception:
+                    pass
+    except Exception:
+        pass  # TimeoutError or other — result stays None, caller handles gracefully
+
     with _cache_lock:
         _quote_cache[symbol] = (time.time(), result)
     return result
@@ -329,7 +533,9 @@ def get_bulk_quotes(symbols: list) -> dict:
     """
     Get live NSE quotes for a list of symbols.
     Returns {symbol: quote_dict_or_None}. Deduplicates input.
-    Fetches in parallel (up to 10 concurrent) for performance.
+    Cache-first: warm hits return in < 1 ms.
+    Cache misses: batch-fetched via Yahoo Finance v7 (1 HTTP call for all),
+    then individual NSE calls only for any still-missing symbols.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -345,16 +551,47 @@ def get_bulk_quotes(symbols: list) -> dict:
         return {}
 
     results: dict = {}
-    max_workers = min(10, len(unique))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(get_quote, sym): sym for sym in unique}
-        for future in as_completed(futures):
-            sym = futures[future]
-            try:
-                results[sym] = future.result()
-            except Exception as e:
-                print(f"[BulkQuotes] Error for {sym}: {e}")
-                results[sym] = None
+    now = time.time()
+
+    # Phase 1: serve all warm cache hits instantly
+    misses = []
+    with _cache_lock:
+        for sym in unique:
+            entry = _quote_cache.get(sym)
+            if entry and (now - entry[0]) < QUOTE_TTL:
+                results[sym] = entry[1]
+            else:
+                misses.append(sym)
+
+    if not misses:
+        return results
+
+    # Phase 2: batch-fetch all misses via Yahoo in a single HTTP call
+    if len(misses) > 1:
+        get_yahoo_batch(misses)
+        still_missing = []
+        with _cache_lock:
+            for sym in misses:
+                entry = _quote_cache.get(sym)
+                if entry and (time.time() - entry[0]) < QUOTE_TTL:
+                    results[sym] = entry[1]
+                else:
+                    still_missing.append(sym)
+        misses = still_missing
+
+    # Phase 3: individual parallel calls for any still-missing (NSE + Yahoo fallback)
+    if misses:
+        max_workers = min(10, len(misses))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(get_quote, sym): sym for sym in misses}
+            for future in as_completed(futures):
+                sym = futures[future]
+                try:
+                    results[sym] = future.result()
+                except Exception as e:
+                    print(f"[BulkQuotes] Error for {sym}: {e}")
+                    results[sym] = None
+
     return results
 
 
@@ -401,50 +638,49 @@ def get_historical(symbol: str, period: str = "1m") -> list:
     # Use direct Yahoo Finance chart API (avoids yfinance Brotli issues)
     _range_map = {"1d": "1d", "1w": "5d", "1m": "1mo", "5y": "5y", "max": "max"}
     yf_range = _range_map.get(period, "1mo")
-    try:
-        resp = _requests.get(
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.NS",
-            params={"range": yf_range, "interval": interval},
-            headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip, deflate"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data   = resp.json()
-        chart  = data.get("chart") or {}
-        res    = (chart.get("result") or [None])[0]
+
+    def _parse_hist(resp_data, sym, prd):
+        chart = resp_data.get("chart") or {}
+        res   = (chart.get("result") or [None])[0]
         if not res:
-            result = []
-        else:
-            timestamps = res.get("timestamp") or []
-            closes     = ((res.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
-            items = []
-            for ts, c in zip(timestamps, closes):
-                if c is None:
-                    continue
-                try:
-                    t = datetime.datetime.fromtimestamp(ts, tz=_IST)
-                    if period == "1d":
-                        label = t.strftime("%Y-%m-%dT%H:%M")
-                    elif period == "1w":
-                        label = str(t.date())
-                    elif period == "1m":
-                        label = str(t.date())
-                    elif period == "5y":
-                        label = str(t.date())
-                    else:  # max
-                        label = str(t.date())
-                    items.append({"time": label, "price": round(float(c), 2)})
-                except Exception:
-                    continue
-            if period == "5y":
-                result = _downsample_points(items, max_points=1250)
-            elif period == "max":
-                result = _downsample_points(items, max_points=1500)
-            else:
-                result = items
-    except Exception as e:
-        print(f"[Historical] Error for {symbol} period={period}: {e}")
-        result = []
+            return []
+        timestamps = res.get("timestamp") or []
+        closes     = ((res.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
+        items = []
+        for ts, c in zip(timestamps, closes):
+            if c is None:
+                continue
+            try:
+                t = datetime.datetime.fromtimestamp(ts, tz=_IST)
+                label = t.strftime("%Y-%m-%dT%H:%M") if prd == "1d" else str(t.date())
+                items.append({"time": label, "price": round(float(c), 2)})
+            except Exception:
+                continue
+        if prd == "5y":
+            return _downsample_points(items, max_points=1250)
+        if prd == "max":
+            return _downsample_points(items, max_points=1500)
+        return items
+
+    result = []
+    for suffix in [".NS", ".BO"]:
+        try:
+            resp = _requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}{suffix}",
+                params={"range": yf_range, "interval": interval},
+                headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip, deflate"},
+                timeout=10,
+            )
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            parsed = _parse_hist(resp.json(), symbol, period)
+            if parsed:
+                result = parsed
+                break
+        except Exception as e:
+            print(f"[Historical] Error for {symbol}{suffix} period={period}: {e}")
+            continue
 
     with _cache_lock:
         _hist_cache[cache_key] = (time.time(), result)

@@ -118,7 +118,7 @@ fastApi.interceptors.response.use(_unwrap, _onErr)
 
 export const fetchSignals      = (p = {})   => api.get('/signals',          { params: p })
 export const refreshRadar      = ()         => api.post('/signals/refresh')
-export const fetchSignalCard   = (sym, fr)  => api.get(`/card/${sym}`,      { params: { force_refresh: fr } })
+export const fetchSignalCard   = (sym, fr)  => api.get(`/card/${sym}`,      { params: { force_refresh: fr }, timeout: 60000 })
 export const sendChatMessage   = (msg, sid) => api.post('/chat',            { message: msg, session_id: sid || null })
 export const clearChat         = (sid)      => api.delete(`/chat/${sid}`)
 export const pingHealth        = ()         => api.get('/health')
