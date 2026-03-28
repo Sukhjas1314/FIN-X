@@ -177,7 +177,7 @@ Real-time price streaming per symbol via WebSocket (`/market/ws/{symbol}`). Mark
 ║   │  ┌────────────────────────────────────────────────────┐  │   ║
 ║   │  │                3-TIER AI STACK                      │  │   ║
 ║   │  │                                                     │  │   ║
-║   │  │  Tier 1  Gemini 2.5 Flash Lite  ←  Primary         │  │   ║
+║   │  │  Tier 1  Groq Llama-3.3-70b-versatile  ←  Primary   │  │   ║
 ║   │  │             ↓ (on quota / error)                    │  │   ║
 ║   │  │  Tier 2  GPT-4o mini            ←  Fallback         │  │   ║
 ║   │  │             ↓ (on quota / error)                    │  │   ║
@@ -198,7 +198,7 @@ Real-time price streaming per symbol via WebSocket (`/market/ws/{symbol}`). Mark
             ▼
   ┌──────────────────┐     ┌─────────────────────┐     ┌──────────────────┐
   │   NSE Scraper    │────▶│   3-Tier AI Stack   │────▶│  Signal Store    │
-  │  (hourly cron)   │     │  Gemini → GPT-4o mini│     │  SQLite / PG     │
+  │  (hourly cron)   │     │  Groq → GPT-4o mini │     │  SQLite / PG     │
   └──────────────────┘     │   → Rule fallback   │     └────────┬─────────┘
                            └─────────────────────┘              │
                                                                  ▼
@@ -262,7 +262,7 @@ Real-time price streaming per symbol via WebSocket (`/market/ws/{symbol}`). Mark
 | **Frontend** | React 18, Tailwind CSS, Vite, Recharts | SPA, code-split builds, dark/light theme |
 | **Backend** | FastAPI, Uvicorn, APScheduler | Async API, hourly scheduling, WebSockets |
 | **Database** | SQLite → PostgreSQL via SQLAlchemy | Auto-switch via `DATABASE_URL` |
-| **AI — Primary** | Gemini 2.5 Flash Lite | Market analysis, chat grounding |
+| **AI — Primary** | Groq Llama-3.3-70b-versatile | Market analysis, chat grounding |
 | **AI — Fallback** | GPT-4o mini | Quota resilience, zero downtime |
 | **AI — Hard fallback** | Custom rule engine | Always-on, no API dependency |
 | **Auth** | JWT (python-jose), bcrypt, Google OAuth 2.0 | Authlib, silent token rotation |
