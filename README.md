@@ -39,7 +39,8 @@ surfacing what it all *means* — in plain language, before the broader market r
 ### Landing Page & Auth
 > Production-grade dark UI with Google OAuth 2.0 and email/password login. Real stats: 500+ NSE stocks, 3-tier AI fallback, <50ms price latency, live WebSocket feed.
 
-<img src="screenshots/landing.png" width="100%" alt="Landing Page"/>
+<img width="1440" height="778" alt="Screenshot 2026-03-28 at 2 54 26 PM" src="https://github.com/user-attachments/assets/e658ee95-a6d0-4f81-b7c5-b024d6c95342" />
+
 
 ---
 
