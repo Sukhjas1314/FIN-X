@@ -59,7 +59,7 @@ surfacing what it all *means* — in plain language, before the broader market r
 ---
 
 ### NSE Signal Card — Per-Stock Deep Analysis
-> Live price chart across 5 timeframes (1D / 1W / 1M / 5Y / ALL), RSI, EMA-20/50, MACD, Bollinger Bands — with full AI technical snapshot. Search any NSE ticker.
+> Live price chart across 5 timeframes (1D / 1W / 1M / 1Y / 5Y / ALL), RSI, EMA-20/50, MACD, Bollinger Bands — with full AI technical snapshot. Search any NSE ticker.
 
 <img src="screenshots/signal-card-dark.png" width="100%" alt="Signal Card Dark"/>
 
@@ -227,13 +227,13 @@ Real-time price streaming per symbol via WebSocket (`/market/ws/{symbol}`). Mark
   EMAIL SIGNUP                              GOOGLE OAUTH 2.0
   ─────────────                             ────────────────
 
-  POST /signup                              GET /google/login
+  POST /signup                           GET /google/login
     │  bcrypt hash (12 rounds)                │  redirect → Google consent
     │  Brevo verification email               │
     ▼                                         ▼
   GET /verify-email?token=               GET /google/callback
-    │  mark is_verified = true               │  fetch email + name
-    │  redirect → frontend                   │  upsert user record
+    │  mark is_verified = true                │  fetch email + name
+    │  redirect → frontend                    │  upsert user record
     ▼                                         ▼
   POST /login                            issue JWT pair
     │  validate credentials                   │
