@@ -301,25 +301,47 @@ cp .env.example .env
 **`.env` reference:**
 
 ```env
-GEMINI_API_KEY=...
-OPENAI_API_KEY=...
-NEWS_API_KEY=...
+# ── FIN-X AI Settings ─────────────────────────────────────────────────────────
+# Primary: Groq — fast, free tier, Llama-3.3-70B
+# Get your key at https://console.groq.com/
+GROQ_API_KEY=your-groq-api-key-starting-with-gsk_
+# Groq is auto-detected when key starts with "gsk_"
+# LLAMA_BASE_URL and LLAMA_MODEL are set automatically for Groq keys.
+# Override only if using a different provider:
+LLAMA_API_KEY=
+LLAMA_BASE_URL=https://api.groq.com/openai/v1
+LLAMA_MODEL=llama-3.3-70b-versatile
+NEWS_API_KEY=your-newsapi-key
+OPENAI_API_KEY=your-openai-api-key
+DATABASE_URL=data/finx.db
+CORS_ORIGINS=http://localhost:5173
+RADAR_INTERVAL_HOURS=1
 
-# python -c "import secrets; print(secrets.token_hex(32))"
-JWT_SECRET_KEY=...
+# ── Auth v2 — JWT ─────────────────────────────────────────────────────────────
+# Generate a strong random key: python -c "import secrets; print(secrets.token_hex(32))"
+JWT_SECRET_KEY=replace-with-a-random-secret-at-least-32-chars
+JWT_ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=60
+REFRESH_TOKEN_EXPIRE_DAYS=14
 
-SMTP_HOST=smtp-relay.brevo.com
-SMTP_PORT=587
-SMTP_USER=your-brevo-login
-SMTP_PASS=your-brevo-key
-SMTP_FROM=verified@yourdomain.com
-
-GOOGLE_CLIENT_ID=...
-GOOGLE_CLIENT_SECRET=...
-
+# ── Auth v2 — App URLs ────────────────────────────────────────────────────────
 APP_URL=http://localhost:5173
 BACKEND_URL=http://localhost:8000
-CORS_ORIGINS=http://localhost:5173
+
+# ── Auth v2 — SMTP (email verification) ──────────────────────────────────────
+# Gmail: create an App Password at Google Account > Security > 2-Step Verification > App passwords
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your.address@gmail.com
+SMTP_PASS=your-16-char-app-password
+
+# ── Auth v2 — Google OAuth (optional) ────────────────────────────────────────
+# Create credentials at console.cloud.google.com > APIs & Services > Credentials
+# Authorised redirect URI (dev): http://localhost:5173/api/v2/auth/google/callback
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+GOOGLE_REDIRECT_URI=http://localhost:5173/api/v2/auth/google/callback
+
 ```
 
 ```bash
